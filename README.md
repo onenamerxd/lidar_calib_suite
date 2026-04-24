@@ -8,14 +8,18 @@
 ## 运行方式
 
 ```bash
-cd /home/rxd/lidar_calib_suite
+cd /path/to/lidar_calib_suite
 ./run_tool.sh
 ```
 
-或者直接用 Python 启动：
+推荐先激活你自己的 Conda / venv 环境，再运行 `./run_tool.sh`。
+
+如果这个项目是通过外部安装器放在某个工具目录下，`run_tool.sh` 也会自动尝试使用上级目录里的 `../.miniconda3/envs/calib/bin/python`。
+
+或者直接用当前环境的 Python 启动：
 
 ```bash
-/home/rxd/.ChenYX/QtWs/bin/python3 launcher.py
+python launcher.py
 ```
 
 ## 项目结构
