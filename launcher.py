@@ -15,17 +15,19 @@ from PySide6.QtWidgets import (
 from camera_intrinsic_calib.main_window import MainWindow as IntrinsicCalibWindow
 from lidar_camera_calib.main_window import MainWindow as CameraCalibWindow
 from lidar_extrinsic_calib_qt.main_window import MainWindow as LidarCalibWindow
+from lidar_imu_calib_qt.main_window import MainWindow as LidarImuCalibWindow
 
 
 class LauncherWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("LiDAR 标定工具箱")
-        self.resize(480, 380)
+        self.resize(480, 460)
 
         self.intrinsic_window: IntrinsicCalibWindow | None = None
         self.camera_window: CameraCalibWindow | None = None
         self.lidar_window: LidarCalibWindow | None = None
+        self.lidar_imu_window: LidarImuCalibWindow | None = None
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -56,7 +58,13 @@ class LauncherWindow(QMainWindow):
         self.btn_lidar.clicked.connect(self._open_lidar_calib)
         layout.addWidget(self.btn_lidar)
 
-        hint = QLabel("提示: 三个工具可以独立运行，不会互相干扰。")
+        self.btn_lidar_imu = QPushButton("LiDAR → IMU 外参标定")
+        self.btn_lidar_imu.setMinimumHeight(60)
+        self.btn_lidar_imu.setStyleSheet("font-size: 16px;")
+        self.btn_lidar_imu.clicked.connect(self._open_lidar_imu_calib)
+        layout.addWidget(self.btn_lidar_imu)
+
+        hint = QLabel("提示: 四个工具可以独立运行，不会互相干扰。")
         hint.setAlignment(Qt.AlignCenter)
         hint.setStyleSheet("color: gray;")
         layout.addWidget(hint)
@@ -81,6 +89,13 @@ class LauncherWindow(QMainWindow):
         self.lidar_window.show()
         self.lidar_window.raise_()
         self.lidar_window.activateWindow()
+
+    def _open_lidar_imu_calib(self) -> None:
+        if self.lidar_imu_window is None:
+            self.lidar_imu_window = LidarImuCalibWindow()
+        self.lidar_imu_window.show()
+        self.lidar_imu_window.raise_()
+        self.lidar_imu_window.activateWindow()
 
 
 def main() -> int:

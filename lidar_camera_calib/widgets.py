@@ -24,6 +24,8 @@ class ImageCanvas(QWidget):
         self._last_drag_pos: QPoint | None = None
         self._pick_enabled = False
         self._flip_mode = 0
+        self._source_image_cache_key: int | None = None
+        self._rendered_flip_mode = self._flip_mode
         self.setMinimumSize(400, 280)
         self.setMouseTracking(True)
 
@@ -49,9 +51,18 @@ class ImageCanvas(QWidget):
         return image
 
     def set_image(self, image: QImage) -> None:
+        source_key = 0 if image.isNull() else image.cacheKey()
+        same_view_source = (
+            not image.isNull()
+            and source_key == self._source_image_cache_key
+            and self._rendered_flip_mode == self._flip_mode
+        )
         self._image = self._apply_flip_to_image(image)
-        self._zoom = 1.0
-        self._pan = QPointF(0.0, 0.0)
+        self._source_image_cache_key = source_key
+        self._rendered_flip_mode = self._flip_mode
+        if not same_view_source:
+            self._zoom = 1.0
+            self._pan = QPointF(0.0, 0.0)
         self.update()
 
     def set_overlay(self, points_uv: np.ndarray, colors_rgb: np.ndarray) -> None:
@@ -691,4 +702,3 @@ class PointCloud3DCanvas(QWidget):
 
     def mouseDoubleClickEvent(self, _event: QMouseEvent) -> None:
         self.reset_view()
-
