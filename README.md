@@ -24,15 +24,16 @@ sudo apt install python3 python3-venv
 
 ```bash
 cd /path/to/lidar_calib_suite
+source .venv/bin/activate
 ./run_tool.sh
 ```
 
-`run_tool.sh` 会自动尝试使用已激活的 Conda / venv 环境、项目内 `.venv`、上级目录 `../.venv`，以及旧安装器生成的 `../.miniconda3/envs/calib`。
+`run_tool.sh` 只是项目启动入口，会优先使用已激活的 Conda / venv 环境，也兼容旧安装器生成的 `../.miniconda3/envs/calib`。
 
 或者直接用当前环境的 Python 启动：
 
 ```bash
-python launcher.py
+.venv/bin/python launcher.py
 ```
 
 ## 项目结构

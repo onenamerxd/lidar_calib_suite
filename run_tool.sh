@@ -2,9 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-LOCAL_VENV_PYTHON="$SCRIPT_DIR/.venv/bin/python"
-PARENT_VENV_PYTHON="$SCRIPT_DIR/../.venv/bin/python"
-LEGACY_BUNDLE_PYTHON="$SCRIPT_DIR/../.miniconda3/envs/calib/bin/python"
+LOCAL_BUNDLE_PYTHON="$SCRIPT_DIR/../.miniconda3/envs/calib/bin/python"
 
 python_can_launch_project() {
     local python_bin="$1"
@@ -42,18 +40,8 @@ find_runtime_python() {
         fi
     fi
 
-    if python_can_launch_project "$LOCAL_VENV_PYTHON"; then
-        printf '%s\n' "$LOCAL_VENV_PYTHON"
-        return 0
-    fi
-
-    if python_can_launch_project "$PARENT_VENV_PYTHON"; then
-        printf '%s\n' "$PARENT_VENV_PYTHON"
-        return 0
-    fi
-
-    if python_can_launch_project "$LEGACY_BUNDLE_PYTHON"; then
-        printf '%s\n' "$LEGACY_BUNDLE_PYTHON"
+    if python_can_launch_project "$LOCAL_BUNDLE_PYTHON"; then
+        printf '%s\n' "$LOCAL_BUNDLE_PYTHON"
         return 0
     fi
 
@@ -76,7 +64,7 @@ PYTHON_BIN="$(find_runtime_python || true)"
 
 if [ -z "$PYTHON_BIN" ]; then
     printf '%s\n' "未找到可用的 Python 环境。" >&2
-    printf '%s\n' "请先创建 .venv 并安装 requirements.txt，或激活一个已安装 PySide6/numpy/opencv-python/scipy/open3d 的环境。" >&2
+    printf '%s\n' "请先激活一个已安装 PySide6/numpy/opencv-python/scipy/open3d 的环境，或使用安装器生成 ../.miniconda3/envs/calib。" >&2
     exit 1
 fi
 
