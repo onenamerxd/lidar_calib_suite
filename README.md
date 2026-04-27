@@ -7,14 +7,27 @@
 
 ## 运行方式
 
+首次使用先创建本地 Python 环境并安装依赖：
+
+```bash
+cd /path/to/lidar_calib_suite
+python3 -m venv .venv
+.venv/bin/python -m pip install -U pip setuptools wheel
+.venv/bin/python -m pip install -r requirements.txt
+```
+
+如果系统提示 `ensurepip` 不可用，Ubuntu/Debian 用户需要先安装：
+
+```bash
+sudo apt install python3 python3-venv
+```
+
 ```bash
 cd /path/to/lidar_calib_suite
 ./run_tool.sh
 ```
 
-推荐先激活你自己的 Conda / venv 环境，再运行 `./run_tool.sh`。
-
-如果这个项目是通过外部安装器放在某个工具目录下，`run_tool.sh` 也会自动尝试使用上级目录里的 `../.miniconda3/envs/calib/bin/python`。
+`run_tool.sh` 会自动尝试使用已激活的 Conda / venv 环境、项目内 `.venv`、上级目录 `../.venv`，以及旧安装器生成的 `../.miniconda3/envs/calib`。
 
 或者直接用当前环境的 Python 启动：
 
