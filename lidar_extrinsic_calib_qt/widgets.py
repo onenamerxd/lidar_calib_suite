@@ -11,6 +11,7 @@ from PySide6.QtWidgets import QWidget
 class PointCloud3DCanvas(QWidget):
     pointPicked = Signal(float, float, float)
     viewChanged = Signal()
+    fullScreenRequested = Signal()
 
     def __init__(self, title: str, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -30,6 +31,8 @@ class PointCloud3DCanvas(QWidget):
 
         self._last_drag_pos: QPoint | None = None
         self._drag_mode: str | None = None
+        self._fullscreen_hovered = False
+        self._fullscreen_button_tooltip = "全屏显示"
         self.setMinimumSize(400, 280)
         self.setMouseTracking(True)
 
@@ -41,9 +44,27 @@ class PointCloud3DCanvas(QWidget):
         self._status_lines = lines
         self.update()
 
+    def set_fullscreen_button_tooltip(self, text: str) -> None:
+        self._fullscreen_button_tooltip = text
+
     def set_points(self, points_xyz: np.ndarray, colors_rgb: np.ndarray) -> None:
         self._points = np.asarray(points_xyz, dtype=np.float32)
         self._colors = np.asarray(colors_rgb, dtype=np.uint8)
+        self.update()
+
+    def copy_from(self, other: "PointCloud3DCanvas") -> None:
+        self._title = other._title
+        self.set_points(other._points.copy(), other._colors.copy())
+        self.set_markers(list(other._markers))
+        self.set_status_lines(list(other._status_lines))
+        self.azimuth_deg = other.azimuth_deg
+        self.elevation_deg = other.elevation_deg
+        self.distance = other.distance
+        self.pan_x = other.pan_x
+        self.pan_y = other.pan_y
+        self.fov_deg = other.fov_deg
+        self._fullscreen_button_tooltip = other._fullscreen_button_tooltip
+        self.set_pick_enabled(other._pick_enabled)
         self.update()
 
     def set_markers(self, markers: list[tuple[float, float, float, str, QColor]]) -> None:
@@ -167,6 +188,54 @@ class PointCloud3DCanvas(QWidget):
         cam_z = (view @ homo.T).T[:, 2]
         return screen, cam_z
 
+    def _fullscreen_button_rect(self) -> QRectF:
+        size = 34.0
+        margin = 12.0
+        return QRectF(self.width() - size - margin, self.height() - size - margin, size, size)
+
+    def _draw_fullscreen_button(self, painter: QPainter) -> None:
+        rect = self._fullscreen_button_rect()
+        bg = QColor(45, 45, 45, 230) if self._fullscreen_hovered else QColor(32, 32, 32, 210)
+        border = QColor(160, 160, 160) if self._fullscreen_hovered else QColor(95, 95, 95)
+
+        painter.setPen(QPen(border, 1))
+        painter.setBrush(bg)
+        painter.drawRoundedRect(rect, 4.0, 4.0)
+
+        painter.setPen(QPen(QColor(245, 245, 245), 2))
+        pad = 9.0
+        short = 7.0
+        left = rect.left() + pad
+        right = rect.right() - pad
+        top = rect.top() + pad
+        bottom = rect.bottom() - pad
+
+        painter.drawLine(QPointF(left, top), QPointF(left + short, top))
+        painter.drawLine(QPointF(left, top), QPointF(left, top + short))
+        painter.drawLine(QPointF(right, top), QPointF(right - short, top))
+        painter.drawLine(QPointF(right, top), QPointF(right, top + short))
+        painter.drawLine(QPointF(left, bottom), QPointF(left + short, bottom))
+        painter.drawLine(QPointF(left, bottom), QPointF(left, bottom - short))
+        painter.drawLine(QPointF(right, bottom), QPointF(right - short, bottom))
+        painter.drawLine(QPointF(right, bottom), QPointF(right, bottom - short))
+
+    def _sync_cursor(self) -> None:
+        if self._fullscreen_hovered:
+            self.setCursor(Qt.PointingHandCursor)
+        elif self._pick_enabled:
+            self.setCursor(Qt.CrossCursor)
+        else:
+            self.setCursor(Qt.ArrowCursor)
+
+    def _update_fullscreen_hover(self, pos: QPointF) -> None:
+        hovered = self._fullscreen_button_rect().contains(pos)
+        if hovered == self._fullscreen_hovered:
+            return
+        self._fullscreen_hovered = hovered
+        self.setToolTip(self._fullscreen_button_tooltip if hovered else "")
+        self._sync_cursor()
+        self.update()
+
     def paintEvent(self, _event) -> None:
         painter = QPainter(self)
         painter.fillRect(self.rect(), QColor(18, 18, 18))
@@ -176,6 +245,7 @@ class PointCloud3DCanvas(QWidget):
         if self._points.shape[0] == 0:
             painter.setPen(QColor(120, 120, 120))
             painter.drawText(self.rect(), Qt.AlignCenter, "未加载点云")
+            self._draw_fullscreen_button(painter)
             return
 
         screen_pts, cam_z = self._project_points(self._points)
@@ -228,6 +298,8 @@ class PointCloud3DCanvas(QWidget):
                 painter.drawText(12, y, line)
                 y += 14
 
+        self._draw_fullscreen_button(painter)
+
     def wheelEvent(self, event) -> None:
         factor = 1.15 if event.angleDelta().y() > 0 else 1.0 / 1.15
         self.distance = max(1.0, min(2000.0, self.distance * factor))
@@ -235,6 +307,10 @@ class PointCloud3DCanvas(QWidget):
         self.update()
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
+        if event.button() == Qt.LeftButton and self._fullscreen_button_rect().contains(event.position()):
+            self.fullScreenRequested.emit()
+            return
+
         if event.button() == Qt.RightButton:
             self._last_drag_pos = event.pos()
             self._drag_mode = "pan"
@@ -260,6 +336,7 @@ class PointCloud3DCanvas(QWidget):
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
         if self._last_drag_pos is None or self._drag_mode is None:
+            self._update_fullscreen_hover(event.position())
             return
         delta = event.pos() - self._last_drag_pos
         if self._drag_mode == "rotate":
@@ -297,7 +374,15 @@ class PointCloud3DCanvas(QWidget):
         if event.button() == Qt.RightButton or event.button() == Qt.LeftButton:
             self._last_drag_pos = None
             self._drag_mode = None
-            self.setCursor(Qt.CrossCursor if self._pick_enabled else Qt.ArrowCursor)
+            self._update_fullscreen_hover(event.position())
+            self._sync_cursor()
+
+    def leaveEvent(self, _event) -> None:
+        if self._fullscreen_hovered:
+            self._fullscreen_hovered = False
+            self.setToolTip("")
+            self._sync_cursor()
+            self.update()
 
     def mouseDoubleClickEvent(self, _event: QMouseEvent) -> None:
         self.reset_view()

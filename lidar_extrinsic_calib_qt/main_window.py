@@ -6,9 +6,11 @@ from pathlib import Path
 import numpy as np
 import open3d as o3d
 from PySide6.QtCore import Qt
+from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
+    QDialog,
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
@@ -41,6 +43,23 @@ from .math_utils import compute_bounding_box, depth_to_rgb
 from .widgets import PointCloud3DCanvas
 
 
+class FullScreenPointCloudWindow(QDialog):
+    def __init__(self, source_canvas: PointCloud3DCanvas, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("点云全屏显示")
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self.canvas = PointCloud3DCanvas("")
+        self.canvas.copy_from(source_canvas)
+        self.canvas.set_fullscreen_button_tooltip("退出全屏")
+        self.canvas.fullScreenRequested.connect(self.close)
+        layout.addWidget(self.canvas)
+
+        self._escape_shortcut = QShortcut(QKeySequence("Esc"), self)
+        self._escape_shortcut.activated.connect(self.close)
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -52,6 +71,7 @@ class MainWindow(QMainWindow):
         self.init_transform: np.ndarray | None = None
         self.result_transform: np.ndarray | None = None
         self.result: RegistrationResult | None = None
+        self.fullscreen_window: FullScreenPointCloudWindow | None = None
 
         self._build_ui()
         self._connect_signals()
@@ -134,8 +154,8 @@ class MainWindow(QMainWindow):
         self.max_points_spin.setRange(1000, 500000)
         self.max_points_spin.setSingleStep(5000)
         self.max_points_spin.setValue(50000)
-        self.color_by_height_checkbox = QCheckBox("按高度着色")
-        self.color_by_height_checkbox.setChecked(True)
+        self.color_by_height_checkbox = QCheckBox("按高度着色（关闭时 Target 红色 / Source 绿色）")
+        self.color_by_height_checkbox.setChecked(False)
         prep_layout.addRow("XY 裁剪半径", self.crop_range_spin)
         prep_layout.addRow("Z 最小值", self.z_min_spin)
         prep_layout.addRow("Z 最大值", self.z_max_spin)
@@ -182,6 +202,8 @@ class MainWindow(QMainWindow):
 
         self.reset_before_view_button.clicked.connect(self._reset_before_views)
         self.reset_after_view_button.clicked.connect(self._reset_after_views)
+        self.before_3d.fullScreenRequested.connect(lambda: self._open_fullscreen_view(self.before_3d))
+        self.after_3d.fullScreenRequested.connect(lambda: self._open_fullscreen_view(self.after_3d))
 
         self.save_matrix_button.clicked.connect(self._save_matrix)
         self.save_aligned_button.clicked.connect(self._save_aligned)
@@ -197,6 +219,19 @@ class MainWindow(QMainWindow):
 
         self.color_by_height_checkbox.toggled.connect(self._update_visuals)
         self.method_combo.currentIndexChanged.connect(self._update_visuals)
+
+    def _open_fullscreen_view(self, canvas: PointCloud3DCanvas) -> None:
+        if self.fullscreen_window is not None:
+            self.fullscreen_window.close()
+
+        window = FullScreenPointCloudWindow(canvas, self)
+        self.fullscreen_window = window
+        window.finished.connect(lambda _result, closed_window=window: self._clear_fullscreen_window(closed_window))
+        window.showFullScreen()
+
+    def _clear_fullscreen_window(self, window: FullScreenPointCloudWindow) -> None:
+        if self.fullscreen_window is window:
+            self.fullscreen_window = None
 
     def _wrap_widget(self, title: str, widget: QWidget) -> QWidget:
         group = QGroupBox(title)
@@ -382,7 +417,7 @@ class MainWindow(QMainWindow):
             all_colors = depth_to_rgb(all_pts[:, 2])
         else:
             target_color = np.full((target_pts.shape[0], 3), [255, 90, 80], dtype=np.uint8)
-            source_color = np.full((source_pts.shape[0], 3), [80, 255, 120] if transform is None else [80, 220, 255], dtype=np.uint8)
+            source_color = np.full((source_pts.shape[0], 3), [80, 255, 120], dtype=np.uint8)
             all_colors = np.concatenate([target_color, source_color], axis=0)
 
         max_points = self.max_points_spin.value()
@@ -417,12 +452,12 @@ class MainWindow(QMainWindow):
         target_count = len(self.target_cloud.points)
         source_count = len(self.source_cloud.points)
 
-        self.before_3d.set_status_lines([f"Target: {target_count} 点", f"Source: {source_count} 点"])
+        self.before_3d.set_status_lines([f"Target(红): {target_count} 点", f"Source(绿): {source_count} 点"])
 
         if self.result_transform is not None:
-            self.after_3d.set_status_lines([f"Target: {target_count} 点", f"Aligned: {source_count} 点", "配准已完成"])
+            self.after_3d.set_status_lines([f"Target(红): {target_count} 点", f"Aligned(绿): {source_count} 点", "配准已完成"])
         else:
-            self.after_3d.set_status_lines([f"Target: {target_count} 点", f"Aligned: {source_count} 点", "尚未配准"])
+            self.after_3d.set_status_lines([f"Target(红): {target_count} 点", f"Aligned(绿): {source_count} 点", "尚未配准"])
 
     def _save_matrix(self) -> None:
         if self.result_transform is None:
