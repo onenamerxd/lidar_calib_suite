@@ -144,6 +144,11 @@ def export_extrinsics(
     rotation_tool, translation = extrinsics_to_rt(extrinsics)
     axis_transform = LIDAR_AXIS_MAPS[lidar_axis_mode]
     rotation_lidar_to_camera = rotation_tool @ axis_transform
+    if np.linalg.det(rotation_lidar_to_camera) < 0.0:
+        raise ValueError(
+            "selected lidar axis mode is left-handed and cannot be exported as rotation_xyzw; "
+            "use a right-handed lidar frame before exporting TF/extrinsics"
+        )
 
     if direction == "lidar_to_camera":
         rotation_out = rotation_lidar_to_camera

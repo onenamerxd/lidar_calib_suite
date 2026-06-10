@@ -953,11 +953,20 @@ class MainWindow(QMainWindow):
 
     def _refresh_extrinsics_output(self) -> None:
         extrinsics = self._current_extrinsics()
-        payload = export_extrinsics(
-            extrinsics,
-            lidar_axis_mode=self._current_lidar_axis_mode(),
-            direction=self._current_export_direction(),
-        )
+        try:
+            payload = export_extrinsics(
+                extrinsics,
+                lidar_axis_mode=self._current_lidar_axis_mode(),
+                direction=self._current_export_direction(),
+            )
+        except ValueError as exc:
+            payload = {
+                "export_error": str(exc),
+                "metadata": {
+                    "export_direction": self._current_export_direction(),
+                    "lidar_axis_mode": self._current_lidar_axis_mode(),
+                },
+            }
         self.extr_output.setPlainText(json.dumps(payload, ensure_ascii=False, indent=2))
 
     def _refresh_correspondence_views(self) -> None:
@@ -1071,6 +1080,9 @@ class MainWindow(QMainWindow):
         if not path:
             return
         payload = json.loads(self.extr_output.toPlainText())
+        if "export_error" in payload:
+            QMessageBox.warning(self, "无法导出外参", payload["export_error"])
+            return
         Path(path).write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         axis_desc = "默认朝向" if self._current_lidar_axis_mode() == "default" else self.lidar_axis_combo.currentText()
         self._append_log(
