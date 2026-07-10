@@ -3,6 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOCAL_BUNDLE_PYTHON="$SCRIPT_DIR/../.miniconda3/envs/calib/bin/python"
+CONDA_CALIB_PYTHON="/home/rxd/anaconda3/envs/calib/bin/python"
 
 python_can_launch_project() {
     local python_bin="$1"
@@ -42,6 +43,11 @@ find_runtime_python() {
 
     if python_can_launch_project "$LOCAL_BUNDLE_PYTHON"; then
         printf '%s\n' "$LOCAL_BUNDLE_PYTHON"
+        return 0
+    fi
+
+    if python_can_launch_project "$CONDA_CALIB_PYTHON"; then
+        printf '%s\n' "$CONDA_CALIB_PYTHON"
         return 0
     fi
 

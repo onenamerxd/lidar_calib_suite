@@ -1,585 +1,747 @@
 from __future__ import annotations
 
-import csv
 import json
-import re
+import math
+import struct
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Callable
 
 import numpy as np
 from scipy.optimize import least_squares
-from scipy.spatial.transform import Rotation, Slerp
+from scipy.spatial.transform import Rotation
+
+
+ProgressCallback = Callable[[str], None]
+
+LIDAR_LASER_NUM = 64
+SCAN_LINE_CUT = 30
+INTENSITY_THRESHOLD = 35.0
+MIN_POINTS_PER_VOXEL = 7
 
 
 @dataclass
-class PoseSample:
-    timestamp: float
-    position: np.ndarray
-    rotation: Rotation
+class OpenCalibPoseFrame:
+    stamp: str
+    pose: np.ndarray
 
 
 @dataclass
-class MotionPair:
-    start_time: float
-    end_time: float
-    imu_motion: np.ndarray
-    lidar_motion: np.ndarray
+class PcdFrame:
+    points: np.ndarray
+    intensity: np.ndarray
+    ring: np.ndarray
+
+
+@dataclass
+class VoxelLeaf:
+    points_orig: list[np.ndarray]
+    points_tran: list[np.ndarray]
+    center: np.ndarray
+    normal: np.ndarray
+    center_zero: np.ndarray
+    normal_zero: np.ndarray
+    center_orig: np.ndarray
+    normal_orig: np.ndarray
+    eigen_ratio: float
+
+
+@dataclass
+class CalibrationRoundInfo:
+    round_index: int
+    start_index: int
+    step: int
+    frame_count: int
+    feature_points: int
+    voxel_count: int
+    residual_count: int
+    cost_before: float
+    cost_after: float
+    delta_rpy_deg: list[float]
+    delta_t: list[float]
 
 
 @dataclass
 class LidarImuCalibrationResult:
     transform_imu_lidar: np.ndarray
+    transform_lidar_imu: np.ndarray
+    initial_transform_imu_lidar: np.ndarray
+    initial_transform_lidar_imu: np.ndarray
+    delta_transform: np.ndarray
     rotation_xyzw: list[float]
     euler_deg: list[float]
     translation: list[float]
-    pair_count: int
-    rotation_rmse_deg: float
-    translation_rmse_m: float
-    time_offset_sec: float
-    interval_sec: float
-    min_rotation_deg: float
+    refined_lidar_to_imu_euler_deg: list[float]
+    refined_lidar_to_imu_translation: list[float]
+    pose_count: int
+    used_frame_count: int
+    pcd_frame_count: int
+    round_count: int
+    residual_rmse_m: float
+    delta_rpy_deg: list[float]
+    delta_translation: list[float]
     warnings: list[str]
-    lidar_source: str = "csv"
+    rounds: list[CalibrationRoundInfo]
+    lidar_source: str = "open_calib_pcd"
     lidar_frame_count: int = 0
+    pair_count: int = 0
+    rotation_rmse_deg: float = 0.0
+    translation_rmse_m: float = 0.0
+    time_offset_sec: float = 0.0
+    interval_sec: float = 0.0
+    min_rotation_deg: float = 0.0
     lidar_registration_mean_fitness: float | None = None
     lidar_registration_mean_rmse_m: float | None = None
     lidar_registration_failed_pairs: int = 0
-
-
-TIME_COLUMNS = ("timestamp", "time", "t", "stamp", "sec")
-TX_COLUMNS = ("tx", "x", "px", "pos_x", "position_x")
-TY_COLUMNS = ("ty", "y", "py", "pos_y", "position_y")
-TZ_COLUMNS = ("tz", "z", "pz", "pos_z", "position_z")
-QX_COLUMNS = ("qx", "quat_x", "orientation_x")
-QY_COLUMNS = ("qy", "quat_y", "orientation_y")
-QZ_COLUMNS = ("qz", "quat_z", "orientation_z")
-QW_COLUMNS = ("qw", "quat_w", "orientation_w")
-ROLL_COLUMNS = ("roll_deg", "roll", "rx")
-PITCH_COLUMNS = ("pitch_deg", "pitch", "ry")
-YAW_COLUMNS = ("yaw_deg", "yaw", "rz")
-PCD_NUMBER_RE = re.compile(r"[-+]?(?:\d+\.\d*|\.\d+|\d+)")
-
-
-def _pick(row: dict[str, str], names: Iterable[str]) -> str | None:
-    lowered = {key.strip().lower(): value for key, value in row.items() if key is not None}
-    for name in names:
-        if name in lowered and lowered[name] != "":
-            return lowered[name]
-    return None
-
-
-def _float_from(row: dict[str, str], names: Iterable[str], label: str) -> float:
-    raw = _pick(row, names)
-    if raw is None:
-        raise ValueError(f"CSV 缺少字段: {label}")
-    return float(raw)
-
-
-def _rotation_from_row(row: dict[str, str]) -> Rotation:
-    qx = _pick(row, QX_COLUMNS)
-    qy = _pick(row, QY_COLUMNS)
-    qz = _pick(row, QZ_COLUMNS)
-    qw = _pick(row, QW_COLUMNS)
-    if None not in (qx, qy, qz, qw):
-        return Rotation.from_quat([float(qx), float(qy), float(qz), float(qw)])
-
-    roll = _pick(row, ROLL_COLUMNS)
-    pitch = _pick(row, PITCH_COLUMNS)
-    yaw = _pick(row, YAW_COLUMNS)
-    if None not in (roll, pitch, yaw):
-        return Rotation.from_euler("xyz", [float(roll), float(pitch), float(yaw)], degrees=True)
-
-    raise ValueError("CSV 需要 qx,qy,qz,qw 或 roll_deg,pitch_deg,yaw_deg")
-
-
-def _has_header(first_line: str) -> bool:
-    tokens = [token.strip() for token in first_line.split(",")]
-    for token in tokens:
-        try:
-            float(token)
-        except ValueError:
-            return True
-    return False
-
-
-def load_pose_csv(path: str | Path, time_offset_sec: float = 0.0) -> list[PoseSample]:
-    csv_path = Path(path)
-    if not csv_path.exists():
-        raise FileNotFoundError(csv_path)
-
-    text = csv_path.read_text(encoding="utf-8-sig").strip()
-    if not text:
-        raise ValueError(f"CSV 为空: {csv_path}")
-
-    samples: list[PoseSample] = []
-    lines = text.splitlines()
-    if _has_header(lines[0]):
-        for row in csv.DictReader(lines):
-            timestamp = _float_from(row, TIME_COLUMNS, "timestamp/time/t") + time_offset_sec
-            position = np.array(
-                [
-                    _float_from(row, TX_COLUMNS, "tx/x"),
-                    _float_from(row, TY_COLUMNS, "ty/y"),
-                    _float_from(row, TZ_COLUMNS, "tz/z"),
-                ],
-                dtype=np.float64,
-            )
-            samples.append(PoseSample(timestamp=timestamp, position=position, rotation=_rotation_from_row(row)))
-    else:
-        data = np.loadtxt(csv_path, delimiter=",", dtype=np.float64)
-        if data.ndim == 1:
-            data = data.reshape(1, -1)
-        if data.shape[1] < 8:
-            raise ValueError("无表头 CSV 至少需要 8 列: timestamp,tx,ty,tz,qx,qy,qz,qw")
-        for row in data:
-            samples.append(
-                PoseSample(
-                    timestamp=float(row[0]) + time_offset_sec,
-                    position=np.asarray(row[1:4], dtype=np.float64),
-                    rotation=Rotation.from_quat(row[4:8]),
-                )
-            )
-
-    samples.sort(key=lambda sample: sample.timestamp)
-    deduped: list[PoseSample] = []
-    for sample in samples:
-        if deduped and abs(sample.timestamp - deduped[-1].timestamp) < 1e-9:
-            continue
-        deduped.append(sample)
-    if len(deduped) < 3:
-        raise ValueError(f"位姿数量不足: {csv_path}")
-    return deduped
 
 
 def _load_open3d():
     try:
         import open3d as o3d
     except ImportError as exc:
-        raise RuntimeError("PCD 文件夹模式需要安装 open3d，请先执行: pip install -r requirements.txt") from exc
+        raise RuntimeError("LiDAR-IMU 自动标定读取 PCD 需要 open3d，请先安装 requirements.txt。") from exc
     return o3d
 
 
-def _last_number_token(text: str) -> str | None:
-    matches = PCD_NUMBER_RE.findall(text)
-    if not matches:
-        return None
-    return matches[-1]
+def transform_points(transform: np.ndarray, points: np.ndarray) -> np.ndarray:
+    return points @ transform[:3, :3].T + transform[:3, 3]
 
 
-def _pcd_sort_key(path: Path) -> tuple[int, float | str]:
-    token = _last_number_token(path.stem)
-    if token is None:
-        return (1, path.name)
-    return (0, float(token))
-
-
-def collect_pcd_files(folder: str | Path) -> list[Path]:
-    pcd_folder = Path(folder)
-    if not pcd_folder.exists():
-        raise FileNotFoundError(pcd_folder)
-    if not pcd_folder.is_dir():
-        raise ValueError(f"PCD 输入必须是文件夹: {pcd_folder}")
-
-    files = [path for path in pcd_folder.iterdir() if path.is_file() and path.suffix.lower() == ".pcd"]
-    files.sort(key=_pcd_sort_key)
-    if len(files) < 3:
-        raise ValueError(f"PCD 文件数量不足，至少需要 3 帧: {pcd_folder}")
-    return files
-
-
-def _timestamp_from_numeric_token(token: str) -> float:
-    value = float(token)
-    if "." in token:
-        return value
-
-    digits = token.lstrip("+-")
-    if len(digits) >= 18:
-        return value / 1e9
-    if len(digits) >= 15:
-        return value / 1e6
-    if len(digits) >= 12:
-        return value / 1e3
-    return value
-
-
-def infer_pcd_timestamps(files: list[Path], frame_interval_sec: float) -> list[float]:
-    if frame_interval_sec <= 0.0:
-        raise ValueError("PCD 帧间隔必须大于 0")
-
-    tokens = [_last_number_token(path.stem) for path in files]
-    if all(token is not None for token in tokens):
-        numeric_tokens = [token for token in tokens if token is not None]
-        looks_like_timestamp = any("." in token for token in numeric_tokens) or max(len(token.lstrip("+-")) for token in numeric_tokens) >= 10
-        if looks_like_timestamp:
-            timestamps = [_timestamp_from_numeric_token(token) for token in numeric_tokens]
-            if len(set(timestamps)) == len(timestamps):
-                return timestamps
-
-    return [index * frame_interval_sec for index in range(len(files))]
-
-
-def load_registration_cloud(
-    path: Path,
-    voxel_size: float,
-    max_points: int,
-    estimate_normals: bool,
-    normal_radius: float,
-):
-    o3d = _load_open3d()
-    cloud = o3d.io.read_point_cloud(str(path))
-    if cloud.is_empty():
-        raise ValueError(f"点云为空: {path}")
-
-    cloud = cloud.remove_non_finite_points()
-    if voxel_size > 0.0:
-        cloud = cloud.voxel_down_sample(voxel_size)
-    point_count = len(cloud.points)
-    if point_count < 20:
-        raise ValueError(f"点云有效点太少: {path}")
-    if max_points > 0 and point_count > max_points:
-        indices = np.linspace(0, point_count - 1, max_points, dtype=np.int64)
-        cloud = cloud.select_by_index(indices.tolist())
-
-    if estimate_normals:
-        search_radius = max(normal_radius, voxel_size * 3.0, 0.5)
-        cloud.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=search_radius, max_nn=30))
-    return cloud
-
-
-def estimate_lidar_odometry_from_pcd_folder(
-    folder: str | Path,
-    frame_interval_sec: float,
-    voxel_size: float,
-    max_correspondence_distance: float,
-    icp_max_iteration: int,
-    icp_method: str = "point_to_point",
-    max_points: int = 80000,
-    progress_callback: Callable[[str], None] | None = None,
-) -> tuple[list[PoseSample], dict[str, float | int | str | list[str]]]:
-    if max_correspondence_distance <= 0.0:
-        raise ValueError("ICP 最大对应距离必须大于 0")
-    if icp_max_iteration <= 0:
-        raise ValueError("ICP 最大迭代次数必须大于 0")
-
-    o3d = _load_open3d()
-    files = collect_pcd_files(folder)
-    timestamps = infer_pcd_timestamps(files, frame_interval_sec)
-    if progress_callback is not None:
-        progress_callback(f"发现 {len(files)} 帧 PCD，开始相邻帧 ICP 里程计。")
-
-    use_point_to_plane = icp_method == "point_to_plane"
-    if use_point_to_plane:
-        estimation = o3d.pipelines.registration.TransformationEstimationPointToPlane()
-    else:
-        estimation = o3d.pipelines.registration.TransformationEstimationPointToPoint()
-
-    criteria = o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=int(icp_max_iteration))
-    normal_radius = max(max_correspondence_distance * 2.0, voxel_size * 3.0, 0.5)
-
-    current_pose = np.eye(4, dtype=np.float64)
-    samples = [PoseSample(timestamp=float(timestamps[0]), position=current_pose[:3, 3].copy(), rotation=Rotation.identity())]
-    fitness_values: list[float] = []
-    rmse_values: list[float] = []
-    warnings: list[str] = []
-
-    target = load_registration_cloud(files[0], voxel_size, max_points, use_point_to_plane, normal_radius)
-    for index, source_path in enumerate(files[1:], start=1):
-        if progress_callback is not None:
-            progress_callback(f"ICP {index}/{len(files) - 1}: {source_path.name}")
-
-        source = load_registration_cloud(source_path, voxel_size, max_points, use_point_to_plane, normal_radius)
-        registration = o3d.pipelines.registration.registration_icp(
-            source,
-            target,
-            max_correspondence_distance,
-            np.eye(4, dtype=np.float64),
-            estimation,
-            criteria,
-        )
-        transform_prev_curr = np.asarray(registration.transformation, dtype=np.float64)
-        current_pose = current_pose @ transform_prev_curr
-
-        try:
-            rotation = Rotation.from_matrix(current_pose[:3, :3])
-        except ValueError as exc:
-            raise ValueError(f"ICP 结果旋转矩阵异常: {source_path}") from exc
-
-        samples.append(
-            PoseSample(
-                timestamp=float(timestamps[index]),
-                position=current_pose[:3, 3].copy(),
-                rotation=rotation,
-            )
-        )
-        fitness_values.append(float(registration.fitness))
-        rmse_values.append(float(registration.inlier_rmse))
-        if registration.fitness < 0.05:
-            warnings.append(f"{source_path.name} ICP fitness 过低({registration.fitness:.3f})，该段里程计可能不可靠。")
-        target = source
-
-    failed_pairs = sum(1 for value in fitness_values if value < 0.05)
-    summary: dict[str, float | int | str | list[str]] = {
-        "source": str(Path(folder)),
-        "frame_count": len(files),
-        "relative_count": max(0, len(files) - 1),
-        "mean_fitness": float(np.mean(fitness_values)) if fitness_values else 0.0,
-        "mean_rmse_m": float(np.mean(rmse_values)) if rmse_values else 0.0,
-        "failed_pairs": int(failed_pairs),
-        "warnings": warnings,
-    }
-    return samples, summary
-
-
-def pose_to_matrix(position: np.ndarray, rotation: Rotation) -> np.ndarray:
+def make_delta_transform(rotvec: np.ndarray, trans_xy: np.ndarray) -> np.ndarray:
     transform = np.eye(4, dtype=np.float64)
-    transform[:3, :3] = rotation.as_matrix()
-    transform[:3, 3] = np.asarray(position, dtype=np.float64)
+    transform[:3, :3] = Rotation.from_rotvec(rotvec).as_matrix()
+    transform[0, 3] = float(trans_xy[0])
+    transform[1, 3] = float(trans_xy[1])
     return transform
 
 
-def interpolate_pose(samples: list[PoseSample], timestamp: float) -> np.ndarray:
-    times = np.array([sample.timestamp for sample in samples], dtype=np.float64)
-    if timestamp < times[0] or timestamp > times[-1]:
-        raise ValueError(f"时间 {timestamp:.6f} 超出轨迹范围 [{times[0]:.6f}, {times[-1]:.6f}]")
-
-    positions = np.vstack([sample.position for sample in samples])
-    position = np.array([np.interp(timestamp, times, positions[:, axis]) for axis in range(3)], dtype=np.float64)
-    rotations = Rotation.concatenate([sample.rotation for sample in samples])
-    rotation = Slerp(times, rotations)([timestamp])[0]
-    return pose_to_matrix(position, rotation)
+def _floor_voxel(points: np.ndarray, voxel_size: float) -> np.ndarray:
+    return np.floor(points / voxel_size).astype(np.int64)
 
 
-def relative_motion(start_pose: np.ndarray, end_pose: np.ndarray) -> np.ndarray:
-    return np.linalg.inv(start_pose) @ end_pose
+def voxel_downsample(points: np.ndarray, voxel_size: float) -> np.ndarray:
+    if points.size == 0 or voxel_size <= 0:
+        return points
+    keys = _floor_voxel(points, voxel_size)
+    buckets: dict[tuple[int, int, int], list[np.ndarray]] = {}
+    for key, point in zip(map(tuple, keys), points, strict=False):
+        buckets.setdefault(key, []).append(point)
+    return np.asarray([np.mean(bucket, axis=0) for bucket in buckets.values()], dtype=np.float64)
 
 
-def build_motion_pairs(
-    lidar_samples: list[PoseSample],
-    imu_samples: list[PoseSample],
-    interval_sec: float,
-    min_rotation_deg: float,
-    max_pairs: int,
-) -> list[MotionPair]:
-    if interval_sec <= 0.0:
-        raise ValueError("运动间隔必须大于 0")
-
-    lidar_start, lidar_end = lidar_samples[0].timestamp, lidar_samples[-1].timestamp
-    imu_start, imu_end = imu_samples[0].timestamp, imu_samples[-1].timestamp
-    start = max(lidar_start, imu_start)
-    end = min(lidar_end, imu_end) - interval_sec
-    if end <= start:
-        raise ValueError("LiDAR 和 IMU 轨迹时间没有足够重叠区间")
-
-    lidar_times = np.array([sample.timestamp for sample in lidar_samples], dtype=np.float64)
-    candidate_times = lidar_times[(lidar_times >= start) & (lidar_times <= end)]
-    if candidate_times.size == 0:
-        candidate_times = np.linspace(start, end, max(2, min(max_pairs, 200)))
-    if candidate_times.size > max_pairs:
-        indices = np.linspace(0, candidate_times.size - 1, max_pairs).astype(int)
-        candidate_times = candidate_times[indices]
-
-    pairs: list[MotionPair] = []
-    min_rot_rad = np.deg2rad(min_rotation_deg)
-    for time in candidate_times:
-        next_time = float(time + interval_sec)
-        lidar_motion = relative_motion(interpolate_pose(lidar_samples, float(time)), interpolate_pose(lidar_samples, next_time))
-        imu_motion = relative_motion(interpolate_pose(imu_samples, float(time)), interpolate_pose(imu_samples, next_time))
-        lidar_angle = np.linalg.norm(Rotation.from_matrix(lidar_motion[:3, :3]).as_rotvec())
-        imu_angle = np.linalg.norm(Rotation.from_matrix(imu_motion[:3, :3]).as_rotvec())
-        if max(lidar_angle, imu_angle) < min_rot_rad:
+def load_open_calib_pose_file(path: str | Path, initial_lidar_to_imu: np.ndarray) -> list[OpenCalibPoseFrame]:
+    pose_path = Path(path)
+    if not pose_path.exists():
+        raise FileNotFoundError(pose_path)
+    frames: list[OpenCalibPoseFrame] = []
+    for line_no, line in enumerate(pose_path.read_text(encoding="utf-8-sig").splitlines(), start=1):
+        stripped = line.strip()
+        if not stripped:
             continue
-        pairs.append(MotionPair(start_time=float(time), end_time=next_time, imu_motion=imu_motion, lidar_motion=lidar_motion))
+        parts = stripped.split()
+        if len(parts) < 13:
+            raise ValueError(f"pose 文件第 {line_no} 行字段不足，需要 timestamp + 12 个矩阵数值。")
+        pose = np.eye(4, dtype=np.float64)
+        values = [float(value) for value in parts[1:13]]
+        pose[:3, :] = np.asarray(values, dtype=np.float64).reshape(3, 4)
+        frames.append(OpenCalibPoseFrame(stamp=parts[0], pose=pose @ initial_lidar_to_imu))
+    if len(frames) < 10:
+        raise ValueError("pose 数量不足，OpenCalib 自动标定建议至少几十帧，并覆盖多段运动。")
+    return frames
 
-    if len(pairs) < 3:
-        raise ValueError("有效运动片段不足。请增大运动幅度、减小最小旋转阈值，或调整运动间隔。")
-    return pairs
+
+def load_open_calib_extrinsic_json(path: str | Path) -> np.ndarray:
+    json_path = Path(path)
+    if not json_path.exists():
+        raise FileNotFoundError(json_path)
+    payload = json.loads(json_path.read_text(encoding="utf-8-sig"))
+    if "transform_imu_lidar" in payload:
+        return np.asarray(payload["transform_imu_lidar"], dtype=np.float64)
+    if "param" in payload and "sensor_calib" in payload["param"]:
+        data = payload["param"]["sensor_calib"]["data"]
+        return np.asarray(data, dtype=np.float64)
+    if not isinstance(payload, dict) or not payload:
+        raise ValueError("初始外参 JSON 为空或格式不正确。")
+    first_key = next(iter(payload))
+    try:
+        data = payload[first_key]["param"]["sensor_calib"]["data"]
+    except (KeyError, TypeError) as exc:
+        raise ValueError("初始外参 JSON 需要包含 root.param.sensor_calib.data 4x4 矩阵。") from exc
+    matrix = np.asarray(data, dtype=np.float64)
+    if matrix.shape != (4, 4):
+        raise ValueError("初始外参矩阵必须是 4x4。")
+    return matrix
 
 
-def solve_hand_eye(motion_pairs: list[MotionPair]) -> tuple[np.ndarray, list[str]]:
+def _parse_pcd_header(raw: bytes) -> tuple[dict[str, list[str] | int], int]:
+    marker = b"DATA "
+    pos = raw.find(marker)
+    if pos < 0:
+        raise ValueError("PCD 文件缺少 DATA 头。")
+    line_end = raw.find(b"\n", pos)
+    if line_end < 0:
+        raise ValueError("PCD DATA 头不完整。")
+    header_text = raw[: line_end + 1].decode("latin1")
+    header: dict[str, list[str] | int] = {}
+    for line in header_text.splitlines():
+        parts = line.strip().split()
+        if not parts or parts[0].startswith("#"):
+            continue
+        key = parts[0].upper()
+        if key in {"FIELDS", "SIZE", "TYPE", "COUNT"}:
+            header[key] = parts[1:]
+        elif key in {"WIDTH", "HEIGHT", "POINTS"}:
+            header[key] = int(parts[1])
+        elif key == "DATA":
+            header[key] = [parts[1].lower()]
+    return header, line_end + 1
+
+
+def _read_pcd_with_fields(path: Path) -> PcdFrame | None:
+    raw = path.read_bytes()
+    header, data_offset = _parse_pcd_header(raw)
+    fields = list(header.get("FIELDS", []))
+    if not fields or "x" not in fields or "y" not in fields or "z" not in fields:
+        return None
+    sizes = [int(value) for value in header.get("SIZE", [])]
+    types = list(header.get("TYPE", []))
+    counts = [int(value) for value in header.get("COUNT", ["1"] * len(fields))]
+    point_count = int(header.get("POINTS", header.get("WIDTH", 0)))
+    data_kind = str(header.get("DATA", [""])[0])
+    if data_kind == "ascii":
+        rows = np.loadtxt(path, comments="#", skiprows=len(raw[:data_offset].decode("latin1").splitlines()))
+        if rows.ndim == 1:
+            rows = rows.reshape(1, -1)
+        point_count = rows.shape[0]
+        field_index = {name: idx for idx, name in enumerate(fields)}
+        points = rows[:, [field_index["x"], field_index["y"], field_index["z"]]].astype(np.float64)
+        intensity = rows[:, field_index["intensity"]].astype(np.float64) if "intensity" in field_index else np.full(point_count, 255.0)
+        ring_name = "ring" if "ring" in field_index else "r" if "r" in field_index else None
+        ring = rows[:, field_index[ring_name]].astype(np.int64) if ring_name else estimate_rings(points)
+        return PcdFrame(points=points, intensity=intensity, ring=ring)
+    if data_kind != "binary":
+        return None
+
+    fmt_parts: list[str] = []
+    expanded_fields: list[str] = []
+    for name, size, typ, count in zip(fields, sizes, types, counts, strict=False):
+        if typ == "F" and size == 4:
+            code = "f"
+        elif typ == "F" and size == 8:
+            code = "d"
+        elif typ == "U" and size == 1:
+            code = "B"
+        elif typ == "U" and size == 2:
+            code = "H"
+        elif typ == "U" and size == 4:
+            code = "I"
+        elif typ == "I" and size == 1:
+            code = "b"
+        elif typ == "I" and size == 2:
+            code = "h"
+        elif typ == "I" and size == 4:
+            code = "i"
+        else:
+            return None
+        fmt_parts.extend([code] * count)
+        expanded_fields.extend([name] * count)
+    point_struct = struct.Struct("<" + "".join(fmt_parts))
+    needed = data_offset + point_struct.size * point_count
+    if len(raw) < needed:
+        raise ValueError(f"PCD 二进制数据长度不足: {path}")
+    field_index: dict[str, int] = {}
+    for idx, name in enumerate(expanded_fields):
+        field_index.setdefault(name, idx)
+    values = np.empty((point_count, len(expanded_fields)), dtype=np.float64)
+    for idx in range(point_count):
+        values[idx] = point_struct.unpack_from(raw, data_offset + idx * point_struct.size)
+    points = values[:, [field_index["x"], field_index["y"], field_index["z"]]]
+    intensity = values[:, field_index["intensity"]] if "intensity" in field_index else np.full(point_count, 255.0)
+    ring_name = "ring" if "ring" in field_index else "r" if "r" in field_index else None
+    ring = values[:, field_index[ring_name]].astype(np.int64) if ring_name else estimate_rings(points)
+    return PcdFrame(points=points.astype(np.float64), intensity=intensity.astype(np.float64), ring=ring)
+
+
+def estimate_rings(points: np.ndarray, ring_count: int = LIDAR_LASER_NUM) -> np.ndarray:
+    distance_xy = np.linalg.norm(points[:, :2], axis=1)
+    angles = np.arctan2(points[:, 2], np.maximum(distance_xy, 1e-9))
+    low, high = np.percentile(angles, [1.0, 99.0])
+    if abs(high - low) < 1e-6:
+        return np.zeros(points.shape[0], dtype=np.int64)
+    ring = np.round((angles - low) / (high - low) * (ring_count - 1)).astype(np.int64)
+    return np.clip(ring, 0, ring_count - 1)
+
+
+def load_pcd_frame(path: str | Path) -> PcdFrame:
+    pcd_path = Path(path)
+    try:
+        parsed = _read_pcd_with_fields(pcd_path)
+    except Exception:
+        parsed = None
+    if parsed is not None:
+        mask = np.isfinite(parsed.points).all(axis=1)
+        if mask.sum() < 20:
+            raise ValueError(f"点云有效点太少: {pcd_path}")
+        return PcdFrame(points=parsed.points[mask], intensity=parsed.intensity[mask], ring=parsed.ring[mask])
+
+    o3d = _load_open3d()
+    cloud = o3d.io.read_point_cloud(str(pcd_path)).remove_non_finite_points()
+    points = np.asarray(cloud.points, dtype=np.float64)
+    if points.shape[0] < 20:
+        raise ValueError(f"点云有效点太少: {pcd_path}")
+    return PcdFrame(points=points, intensity=np.full(points.shape[0], 255.0), ring=estimate_rings(points))
+
+
+def collect_open_calib_pcd_files(folder: str | Path, pose_frames: list[OpenCalibPoseFrame]) -> list[Path]:
+    pcd_dir = Path(folder)
+    if not pcd_dir.exists() or not pcd_dir.is_dir():
+        raise ValueError(f"PCD 输入必须是文件夹: {pcd_dir}")
+    files = [pcd_dir / f"{frame.stamp}.pcd" for frame in pose_frames]
+    found = [path for path in files if path.exists()]
+    if len(found) < 3:
+        raise ValueError("PCD 文件名需要与 pose 第一列时间戳一致，例如 2021-...-468.pcd。")
+    return found
+
+
+def extract_loam_features(frame: PcdFrame) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    points = frame.points
+    intensity = frame.intensity
+    rings = frame.ring
+    surf_less_flat: list[np.ndarray] = []
+    surf_flat: list[np.ndarray] = []
+    corner_sharp: list[np.ndarray] = []
+
+    for ring_id in range(LIDAR_LASER_NUM):
+        indices = np.flatnonzero(rings == ring_id)
+        if indices.size < 11:
+            continue
+        scan_points = points[indices]
+        scan_intensity = intensity[indices]
+        curvature = np.zeros(indices.size, dtype=np.float64)
+        for local_idx in range(5, indices.size - 5):
+            diff = scan_points[local_idx - 5 : local_idx].sum(axis=0)
+            diff += scan_points[local_idx + 1 : local_idx + 6].sum(axis=0)
+            diff -= 10.0 * scan_points[local_idx]
+            curvature[local_idx] = float(diff @ diff)
+        picked = np.zeros(indices.size, dtype=bool)
+        labels = np.zeros(indices.size, dtype=np.int8)
+        valid_start, valid_end = 5, indices.size - 6
+        valid_count = valid_end - valid_start
+        if valid_count < 6:
+            continue
+        for segment in range(SCAN_LINE_CUT):
+            start = valid_start + valid_count * segment // SCAN_LINE_CUT
+            end = valid_start + valid_count * (segment + 1) // SCAN_LINE_CUT - 1
+            if end <= start:
+                continue
+            order = np.argsort(curvature[start : end + 1]) + start
+            largest = 0
+            for local_idx in reversed(order):
+                if scan_intensity[local_idx] < INTENSITY_THRESHOLD:
+                    continue
+                if picked[local_idx] or curvature[local_idx] <= 10.0:
+                    continue
+                largest += 1
+                if largest <= 2:
+                    labels[local_idx] = 2
+                    corner_sharp.append(scan_points[local_idx])
+                elif largest <= 20:
+                    labels[local_idx] = 1
+                else:
+                    break
+                picked[local_idx] = True
+                _mark_neighbors(scan_points, picked, local_idx)
+            smallest = 0
+            for local_idx in order:
+                if scan_intensity[local_idx] < INTENSITY_THRESHOLD:
+                    continue
+                if picked[local_idx] or curvature[local_idx] >= 10.0:
+                    continue
+                labels[local_idx] = -1
+                surf_flat.append(scan_points[local_idx])
+                smallest += 1
+                picked[local_idx] = True
+                _mark_neighbors(scan_points, picked, local_idx)
+                if smallest >= 4:
+                    break
+            for local_idx in range(start, end + 1):
+                if scan_intensity[local_idx] >= INTENSITY_THRESHOLD and labels[local_idx] <= 0:
+                    surf_less_flat.append(scan_points[local_idx])
+
+    surf = voxel_downsample(np.asarray(surf_less_flat, dtype=np.float64), 0.2) if surf_less_flat else np.empty((0, 3))
+    surf_sharp = np.asarray(surf_flat, dtype=np.float64) if surf_flat else np.empty((0, 3))
+    corn = np.asarray(corner_sharp, dtype=np.float64) if corner_sharp else np.empty((0, 3))
+    return surf, surf_sharp, corn
+
+
+def _mark_neighbors(scan_points: np.ndarray, picked: np.ndarray, local_idx: int) -> None:
+    for offset in range(1, 6):
+        nxt = local_idx + offset
+        if nxt >= scan_points.shape[0]:
+            break
+        if float(np.sum((scan_points[nxt] - scan_points[nxt - 1]) ** 2)) > 0.05:
+            break
+        picked[nxt] = True
+    for offset in range(-1, -6, -1):
+        prv = local_idx + offset
+        if prv < 0:
+            break
+        if float(np.sum((scan_points[prv] - scan_points[prv + 1]) ** 2)) > 0.05:
+            break
+        picked[prv] = True
+
+
+def _fit_leaf(points_orig: list[np.ndarray], points_tran: list[np.ndarray]) -> VoxelLeaf | None:
+    all_tran = np.vstack([pts for pts in points_tran if pts.size])
+    all_orig = np.vstack([pts for pts in points_orig if pts.size])
+    if all_tran.shape[0] < MIN_POINTS_PER_VOXEL or points_orig[0].shape[0] == 0:
+        return None
+    center = all_tran.mean(axis=0)
+    cov = np.cov(all_tran.T, bias=True)
+    eigvals, eigvecs = np.linalg.eigh(cov)
+    if eigvals[0] <= 1e-12:
+        return None
+    normal = eigvecs[:, 0]
+    eigen_ratio = float(eigvals[2] / eigvals[0])
+    angle = math.degrees(math.acos(float(np.clip(abs(normal @ np.array([0.0, 0.0, 1.0])), -1.0, 1.0))))
+    if angle > 20.0:
+        return None
+
+    zero = points_tran[0]
+    orig0 = points_orig[0]
+    center_zero, normal_zero = _center_and_plane_normal(zero)
+    center_orig, normal_orig = _center_and_plane_normal(orig0)
+    return VoxelLeaf(
+        points_orig=points_orig,
+        points_tran=points_tran,
+        center=center,
+        normal=normal,
+        center_zero=center_zero,
+        normal_zero=normal_zero,
+        center_orig=center_orig,
+        normal_orig=normal_orig,
+        eigen_ratio=eigen_ratio,
+    )
+
+
+def _center_and_plane_normal(points: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    center = points.mean(axis=0)
+    cov = np.cov(points.T, bias=True)
+    _, eigvecs = np.linalg.eigh(cov)
+    return center, eigvecs[:, 0]
+
+
+def _subdivide_leaf(
+    points_orig: list[np.ndarray],
+    points_tran: list[np.ndarray],
+    voxel_center: np.ndarray,
+    quarter_length: float,
+    depth: int,
+    max_depth: int,
+    eigen_limit: float,
+) -> list[VoxelLeaf]:
+    leaf = _fit_leaf(points_orig, points_tran)
+    if leaf is None:
+        return []
+    if leaf.eigen_ratio >= eigen_limit:
+        return [leaf]
+    if depth >= max_depth:
+        return []
+    children_orig: list[list[list[np.ndarray]]] = [[[] for _ in points_orig] for _ in range(8)]
+    children_tran: list[list[list[np.ndarray]]] = [[[] for _ in points_tran] for _ in range(8)]
+    for frame_idx, tran_points in enumerate(points_tran):
+        orig_points = points_orig[frame_idx]
+        for orig_point, tran_point in zip(orig_points, tran_points, strict=False):
+            xyz = (tran_point > voxel_center).astype(np.int64)
+            child = int(4 * xyz[0] + 2 * xyz[1] + xyz[2])
+            children_orig[child][frame_idx].append(orig_point)
+            children_tran[child][frame_idx].append(tran_point)
+    result: list[VoxelLeaf] = []
+    for child in range(8):
+        child_orig = [np.asarray(bucket, dtype=np.float64).reshape(-1, 3) for bucket in children_orig[child]]
+        child_tran = [np.asarray(bucket, dtype=np.float64).reshape(-1, 3) for bucket in children_tran[child]]
+        if sum(len(bucket) for bucket in child_tran) < MIN_POINTS_PER_VOXEL:
+            continue
+        bits = np.array([(child >> 2) & 1, (child >> 1) & 1, child & 1], dtype=np.float64)
+        child_center = voxel_center + (2.0 * bits - 1.0) * quarter_length
+        result.extend(_subdivide_leaf(child_orig, child_tran, child_center, quarter_length / 2.0, depth + 1, max_depth, eigen_limit))
+    return result
+
+
+def build_voxel_leaves(
+    feature_frames: list[np.ndarray],
+    poses: list[np.ndarray],
+    delta_transform: np.ndarray,
+    voxel_size: float,
+    max_depth: int,
+    eigen_limit: float,
+) -> tuple[list[VoxelLeaf], int]:
+    buckets: dict[tuple[int, int, int], tuple[list[list[np.ndarray]], list[list[np.ndarray]]]] = {}
+    total_points = 0
+    for frame_idx, points in enumerate(feature_frames):
+        if points.size == 0:
+            continue
+        transformed = transform_points(poses[frame_idx] @ delta_transform, points)
+        total_points += points.shape[0]
+        keys = map(tuple, _floor_voxel(transformed, voxel_size))
+        for key, orig_point, tran_point in zip(keys, points, transformed, strict=False):
+            if key not in buckets:
+                buckets[key] = ([[] for _ in feature_frames], [[] for _ in feature_frames])
+            buckets[key][0][frame_idx].append(orig_point)
+            buckets[key][1][frame_idx].append(tran_point)
+
+    leaves: list[VoxelLeaf] = []
+    for key, (orig_lists, tran_lists) in buckets.items():
+        points_orig = [np.asarray(bucket, dtype=np.float64).reshape(-1, 3) for bucket in orig_lists]
+        points_tran = [np.asarray(bucket, dtype=np.float64).reshape(-1, 3) for bucket in tran_lists]
+        voxel_center = (np.asarray(key, dtype=np.float64) + 0.5) * voxel_size
+        leaves.extend(_subdivide_leaf(points_orig, points_tran, voxel_center, voxel_size / 4.0, 0, max_depth, eigen_limit))
+    return leaves, total_points
+
+
+def residuals_from_leaves(params: np.ndarray, leaves: list[VoxelLeaf], poses: list[np.ndarray], method: int) -> np.ndarray:
+    rotvec = params[:3]
+    trans_xy = params[3:5] if method == 2 else np.zeros(2, dtype=np.float64)
+    delta = make_delta_transform(rotvec, trans_xy)
+    residual_chunks: list[np.ndarray] = []
+    for leaf in leaves:
+        if leaf.points_orig[0].shape[0] == 0:
+            continue
+        if method == 4:
+            point_average = leaf.center_orig
+            normal = leaf.normal_orig
+            pose0 = poses[0]
+        else:
+            point_average = leaf.center_orig
+            normal = leaf.normal_orig
+            pose0 = poses[0]
+        avg_imu = transform_points(pose0 @ delta, point_average.reshape(1, 3))[0]
+        normal_imu = (pose0[:3, :3] @ delta[:3, :3] @ normal)
+        norm = np.linalg.norm(normal_imu)
+        if norm < 1e-9:
+            continue
+        normal_imu = normal_imu / norm
+        for frame_idx, points in enumerate(leaf.points_orig):
+            if points.size == 0:
+                continue
+            transformed = transform_points(poses[frame_idx] @ delta, points)
+            residual_chunks.append((transformed - avg_imu) @ normal_imu)
+    if not residual_chunks:
+        return np.empty(0, dtype=np.float64)
+    return np.concatenate(residual_chunks)
+
+
+def _calibrate_round(
+    round_index: int,
+    pcd_dir: Path,
+    frames: list[OpenCalibPoseFrame],
+    start: int,
+    step: int,
+    frame_count: int,
+    current_params: np.ndarray,
+    method: int,
+    voxel_size: float,
+    max_depth: int,
+    eigen_limit: float,
+    max_residuals: int,
+    progress_callback: ProgressCallback | None,
+) -> tuple[np.ndarray, CalibrationRoundInfo]:
+    feature_frames: list[np.ndarray] = []
+    poses: list[np.ndarray] = []
+    for local_idx in range(frame_count):
+        frame_idx = start + local_idx * step
+        pose_frame = frames[frame_idx]
+        pcd_path = pcd_dir / f"{pose_frame.stamp}.pcd"
+        if not pcd_path.exists():
+            raise FileNotFoundError(pcd_path)
+        if progress_callback:
+            progress_callback(f"第 {round_index + 1} 轮: 读取/提取特征 {local_idx + 1}/{frame_count} {pcd_path.name}")
+        surf, surf_sharp, _corn = extract_loam_features(load_pcd_frame(pcd_path))
+        features = surf_sharp if method == 4 else surf
+        feature_frames.append(features)
+        poses.append(pose_frame.pose)
+
+    delta = make_delta_transform(current_params[:3], current_params[3:5])
+    leaves, feature_points = build_voxel_leaves(feature_frames, poses, delta, voxel_size, max_depth, eigen_limit)
+    if not leaves:
+        raise ValueError("没有可优化的体素平面特征，请检查 PCD ring/intensity 字段、场景纹理和初始外参。")
+
+    x0 = current_params[:3] if method == 4 else current_params[:5]
+
+    def fun(x: np.ndarray) -> np.ndarray:
+        params = current_params.copy()
+        if method == 4:
+            params[:3] = x
+        else:
+            params[:5] = x
+        residuals = residuals_from_leaves(params, leaves, poses, method)
+        if max_residuals > 0 and residuals.size > max_residuals:
+            index = np.linspace(0, residuals.size - 1, max_residuals, dtype=np.int64)
+            residuals = residuals[index]
+        return residuals
+
+    before = fun(x0)
+    result = least_squares(fun, x0=x0, loss="soft_l1", f_scale=0.2, max_nfev=60, xtol=1e-6, ftol=1e-6, gtol=1e-6)
+    updated = current_params.copy()
+    if method == 4:
+        updated[:3] = result.x
+    else:
+        updated[:5] = result.x
+    after = fun(result.x)
+    info = CalibrationRoundInfo(
+        round_index=round_index,
+        start_index=start,
+        step=step,
+        frame_count=frame_count,
+        feature_points=feature_points,
+        voxel_count=len(leaves),
+        residual_count=int(after.size),
+        cost_before=float(np.sqrt(np.mean(before**2))) if before.size else float("inf"),
+        cost_after=float(np.sqrt(np.mean(after**2))) if after.size else float("inf"),
+        delta_rpy_deg=[float(v) for v in np.rad2deg(updated[:3])],
+        delta_t=[float(updated[3]), float(updated[4]), 0.0],
+    )
+    return updated, info
+
+
+def calibrate_lidar_imu_open_calib(
+    pcd_folder: str | Path,
+    pose_file: str | Path,
+    extrinsic_json: str | Path,
+    turn_count: int = 20,
+    window_size: int = 10,
+    upper_bound: int = 1000,
+    voxel_size: float = 1.0,
+    max_depth: int = 5,
+    eigen_limit: float = 16.0,
+    max_residuals: int = 30000,
+    progress_callback: ProgressCallback | None = None,
+) -> LidarImuCalibrationResult:
+    if turn_count < 1:
+        raise ValueError("优化轮数必须大于 0。")
+    if window_size < 3:
+        raise ValueError("滑窗帧数至少为 3。")
+    if voxel_size <= 0:
+        raise ValueError("体素边长必须大于 0。")
+
+    initial_imu_lidar = load_open_calib_extrinsic_json(extrinsic_json)
+    initial_lidar_imu = np.linalg.inv(initial_imu_lidar)
+    frames = load_open_calib_pose_file(pose_file, initial_lidar_imu)
+    pcd_dir = Path(pcd_folder)
+    found = collect_open_calib_pcd_files(pcd_dir, frames)
+
+    usable_upper = min(len(frames), len(found), int(upper_bound))
+    if usable_upper <= window_size + 1:
+        raise ValueError("可用 PCD/pose 帧数不足，无法组成 OpenCalib 滑窗。")
+    start_step = max(1, usable_upper // 2 // turn_count - 1)
+    params = np.zeros(5, dtype=np.float64)
+    rounds: list[CalibrationRoundInfo] = []
+
+    for round_index in range(turn_count):
+        start = max(0, usable_upper // 2 - round_index * start_step - 1)
+        step = max(1, (usable_upper - start) // window_size - 1)
+        if start + (window_size - 1) * step >= usable_upper:
+            step = max(1, (usable_upper - start - 1) // max(1, window_size - 1))
+        method = 4 if round_index < turn_count // 2 else 2
+        if progress_callback:
+            stage = "旋转粗优化" if method == 4 else "旋转+XY平移精优化"
+            progress_callback(f"开始第 {round_index + 1}/{turn_count} 轮 {stage}: start={start}, step={step}, window={window_size}")
+        params, info = _calibrate_round(
+            round_index=round_index,
+            pcd_dir=pcd_dir,
+            frames=frames,
+            start=start,
+            step=step,
+            frame_count=window_size,
+            current_params=params,
+            method=method,
+            voxel_size=voxel_size,
+            max_depth=max_depth,
+            eigen_limit=eigen_limit,
+            max_residuals=max_residuals,
+            progress_callback=progress_callback,
+        )
+        rounds.append(info)
+        if progress_callback:
+            progress_callback(
+                f"第 {round_index + 1} 轮完成: RMSE {info.cost_before:.4f} -> {info.cost_after:.4f}, "
+                f"delta_rpy={info.delta_rpy_deg}, delta_t={info.delta_t}"
+            )
+
+    delta_transform = make_delta_transform(params[:3], params[3:5])
+    refined_lidar_imu = initial_lidar_imu @ delta_transform
+    refined_imu_lidar = np.linalg.inv(refined_lidar_imu)
+    rotation = Rotation.from_matrix(refined_imu_lidar[:3, :3])
+    residual_rmse = rounds[-1].cost_after if rounds else float("inf")
     warnings: list[str] = []
-
-    def rotation_residual(rotvec: np.ndarray) -> np.ndarray:
-        rotation_x = Rotation.from_rotvec(rotvec).as_matrix()
-        residuals = []
-        for pair in motion_pairs:
-            rotation_a = pair.imu_motion[:3, :3]
-            rotation_b = pair.lidar_motion[:3, :3]
-            error = rotation_a @ rotation_x @ rotation_b.T @ rotation_x.T
-            residuals.append(Rotation.from_matrix(error).as_rotvec())
-        return np.concatenate(residuals)
-
-    rotation_result = least_squares(rotation_residual, x0=np.zeros(3), loss="soft_l1", f_scale=0.1, max_nfev=300)
-    rotation_x = Rotation.from_rotvec(rotation_result.x).as_matrix()
-
-    lhs_rows = []
-    rhs_rows = []
-    for pair in motion_pairs:
-        rotation_a = pair.imu_motion[:3, :3]
-        translation_a = pair.imu_motion[:3, 3]
-        translation_b = pair.lidar_motion[:3, 3]
-        lhs_rows.append(rotation_a - np.eye(3))
-        rhs_rows.append(rotation_x @ translation_b - translation_a)
-
-    lhs = np.vstack(lhs_rows)
-    rhs = np.concatenate(rhs_rows)
-    translation_x, *_ = np.linalg.lstsq(lhs, rhs, rcond=None)
-
-    rank = np.linalg.matrix_rank(lhs)
-    if rank < 3:
-        warnings.append("平移约束矩阵秩不足，平移结果可能不可靠。需要更多非共线运动。")
-
-    transform = np.eye(4, dtype=np.float64)
-    transform[:3, :3] = rotation_x
-    transform[:3, 3] = translation_x
-    return transform, warnings
-
-
-def compute_motion_errors(transform_imu_lidar: np.ndarray, motion_pairs: list[MotionPair]) -> tuple[float, float]:
-    rotation_errors = []
-    translation_errors = []
-    inv_left = None
-    for pair in motion_pairs:
-        left = pair.imu_motion @ transform_imu_lidar
-        right = transform_imu_lidar @ pair.lidar_motion
-        inv_left = np.linalg.inv(left)
-        error = inv_left @ right
-        rotation_errors.append(np.linalg.norm(Rotation.from_matrix(error[:3, :3]).as_rotvec()))
-        translation_errors.append(np.linalg.norm(error[:3, 3]))
-
-    if inv_left is None:
-        return float("inf"), float("inf")
-    return float(np.rad2deg(np.sqrt(np.mean(np.square(rotation_errors))))), float(np.sqrt(np.mean(np.square(translation_errors))))
-
-
-def calibrate_lidar_imu(
-    lidar_csv: str | Path,
-    imu_csv: str | Path,
-    interval_sec: float,
-    min_rotation_deg: float,
-    max_pairs: int,
-    imu_time_offset_sec: float = 0.0,
-) -> LidarImuCalibrationResult:
-    lidar_samples = load_pose_csv(lidar_csv)
-    return calibrate_lidar_imu_from_samples(
-        lidar_samples=lidar_samples,
-        imu_csv=imu_csv,
-        interval_sec=interval_sec,
-        min_rotation_deg=min_rotation_deg,
-        max_pairs=max_pairs,
-        imu_time_offset_sec=imu_time_offset_sec,
-        lidar_source=f"csv:{Path(lidar_csv)}",
-        lidar_frame_count=len(lidar_samples),
-    )
-
-
-def calibrate_lidar_imu_from_samples(
-    lidar_samples: list[PoseSample],
-    imu_csv: str | Path,
-    interval_sec: float,
-    min_rotation_deg: float,
-    max_pairs: int,
-    imu_time_offset_sec: float = 0.0,
-    lidar_source: str = "samples",
-    lidar_frame_count: int | None = None,
-    lidar_registration_mean_fitness: float | None = None,
-    lidar_registration_mean_rmse_m: float | None = None,
-    lidar_registration_failed_pairs: int = 0,
-    extra_warnings: list[str] | None = None,
-) -> LidarImuCalibrationResult:
-    imu_samples = load_pose_csv(imu_csv, time_offset_sec=imu_time_offset_sec)
-    motion_pairs = build_motion_pairs(
-        lidar_samples=lidar_samples,
-        imu_samples=imu_samples,
-        interval_sec=interval_sec,
-        min_rotation_deg=min_rotation_deg,
-        max_pairs=max_pairs,
-    )
-    transform, warnings = solve_hand_eye(motion_pairs)
-    rotation_rmse_deg, translation_rmse_m = compute_motion_errors(transform, motion_pairs)
-    rotation = Rotation.from_matrix(transform[:3, :3])
-    quat = rotation.as_quat()
-    euler = rotation.as_euler("xyz", degrees=True)
-
-    if len(motion_pairs) < 10:
-        warnings.append("有效运动片段少于 10 组，建议采集更长且运动更丰富的数据。")
-    if rotation_rmse_deg > 2.0:
-        warnings.append("旋转残差偏大，检查时间同步、坐标系约定和轨迹质量。")
-    if not np.isfinite(translation_rmse_m) or translation_rmse_m > 0.5:
-        warnings.append("平移残差偏大，平移外参可能不可靠。")
-    if extra_warnings:
-        warnings.extend(extra_warnings)
+    if len(found) < len(frames):
+        warnings.append(f"pose 中有 {len(frames)} 帧，实际匹配到 {len(found)} 个 PCD；缺失帧已限制可用范围。")
+    if residual_rmse > 0.3:
+        warnings.append("最终体素平面残差偏大，建议检查时间同步、初始外参、点云 ring/intensity 字段和采集轨迹。")
+    if abs(params[4]) < 1e-12 and abs(params[3]) < 1e-12:
+        warnings.append("平移只按 OpenCalib 原实现优化 X/Y 增量，Z 平移保持初始值。")
 
     return LidarImuCalibrationResult(
-        transform_imu_lidar=transform,
-        rotation_xyzw=[float(value) for value in quat],
-        euler_deg=[float(value) for value in euler],
-        translation=[float(value) for value in transform[:3, 3]],
-        pair_count=len(motion_pairs),
-        rotation_rmse_deg=rotation_rmse_deg,
-        translation_rmse_m=translation_rmse_m,
-        time_offset_sec=float(imu_time_offset_sec),
-        interval_sec=float(interval_sec),
-        min_rotation_deg=float(min_rotation_deg),
+        transform_imu_lidar=refined_imu_lidar,
+        transform_lidar_imu=refined_lidar_imu,
+        initial_transform_imu_lidar=initial_imu_lidar,
+        initial_transform_lidar_imu=initial_lidar_imu,
+        delta_transform=delta_transform,
+        rotation_xyzw=[float(v) for v in rotation.as_quat()],
+        euler_deg=[float(v) for v in rotation.as_euler("xyz", degrees=True)],
+        translation=[float(v) for v in refined_imu_lidar[:3, 3]],
+        refined_lidar_to_imu_euler_deg=[float(v) for v in Rotation.from_matrix(refined_lidar_imu[:3, :3]).as_euler("xyz", degrees=True)],
+        refined_lidar_to_imu_translation=[float(v) for v in refined_lidar_imu[:3, 3]],
+        pose_count=len(frames),
+        used_frame_count=usable_upper,
+        pcd_frame_count=len(found),
+        round_count=len(rounds),
+        residual_rmse_m=float(residual_rmse),
+        delta_rpy_deg=[float(v) for v in np.rad2deg(params[:3])],
+        delta_translation=[float(params[3]), float(params[4]), 0.0],
         warnings=warnings,
-        lidar_source=lidar_source,
-        lidar_frame_count=int(lidar_frame_count if lidar_frame_count is not None else len(lidar_samples)),
-        lidar_registration_mean_fitness=lidar_registration_mean_fitness,
-        lidar_registration_mean_rmse_m=lidar_registration_mean_rmse_m,
-        lidar_registration_failed_pairs=int(lidar_registration_failed_pairs),
+        rounds=rounds,
+        lidar_source=f"open_calib_pcd:{pcd_dir}",
+        lidar_frame_count=len(found),
+        pair_count=len(rounds),
+        translation_rmse_m=float(residual_rmse),
     )
 
 
 def calibrate_lidar_imu_from_pcd_folder(
     pcd_folder: str | Path,
     imu_csv: str | Path,
-    interval_sec: float,
-    min_rotation_deg: float,
-    max_pairs: int,
+    interval_sec: float = 1.0,
+    min_rotation_deg: float = 1.0,
+    max_pairs: int = 400,
     imu_time_offset_sec: float = 0.0,
     pcd_frame_interval_sec: float = 0.1,
-    voxel_size: float = 0.5,
+    voxel_size: float = 1.0,
     max_correspondence_distance: float = 1.5,
     icp_max_iteration: int = 50,
     icp_method: str = "point_to_point",
     max_points: int = 80000,
-    progress_callback: Callable[[str], None] | None = None,
+    progress_callback: ProgressCallback | None = None,
 ) -> LidarImuCalibrationResult:
-    lidar_samples, summary = estimate_lidar_odometry_from_pcd_folder(
-        folder=pcd_folder,
-        frame_interval_sec=pcd_frame_interval_sec,
-        voxel_size=voxel_size,
-        max_correspondence_distance=max_correspondence_distance,
-        icp_max_iteration=icp_max_iteration,
-        icp_method=icp_method,
-        max_points=max_points,
-        progress_callback=progress_callback,
-    )
-    warnings = list(summary.get("warnings", []))
-    mean_fitness = float(summary["mean_fitness"])
-    if mean_fitness < 0.2:
-        warnings.append("PCD ICP 平均 fitness 偏低，建议增大最大对应距离、减小运动间隔或检查点云重叠。")
+    raise RuntimeError("旧版 PCD+ICP 手眼方案已替换。请调用 calibrate_lidar_imu_open_calib(pcd_folder, pose_file, extrinsic_json)。")
 
-    return calibrate_lidar_imu_from_samples(
-        lidar_samples=lidar_samples,
-        imu_csv=imu_csv,
-        interval_sec=interval_sec,
-        min_rotation_deg=min_rotation_deg,
-        max_pairs=max_pairs,
-        imu_time_offset_sec=imu_time_offset_sec,
-        lidar_source=f"pcd_folder:{Path(pcd_folder)}",
-        lidar_frame_count=int(summary["frame_count"]),
-        lidar_registration_mean_fitness=mean_fitness,
-        lidar_registration_mean_rmse_m=float(summary["mean_rmse_m"]),
-        lidar_registration_failed_pairs=int(summary["failed_pairs"]),
-        extra_warnings=warnings,
-    )
+
+def calibrate_lidar_imu(*args, **kwargs) -> LidarImuCalibrationResult:
+    raise RuntimeError("旧版 CSV 手眼方案已替换。请使用 OpenCalib 自动方案: PCD 文件夹 + pose 矩阵文件 + 初始外参 JSON。")
 
 
 def result_to_json(result: LidarImuCalibrationResult) -> str:
     payload = {
-        "convention": "P_imu = R_imu_lidar * P_lidar + t_imu_lidar",
+        "algorithm": "OpenCalib lidar2imu auto calibration (Python BALM-style port)",
+        "convention": {
+            "transform_imu_lidar": "Refined IMU -> LiDAR matrix, same direction as OpenCalib refined_calib_imu_to_lidar.txt.",
+            "transform_lidar_imu": "Inverse matrix. It maps LiDAR points into IMU frame and is used internally during optimization.",
+            "delta_transform": "Increment optimized on top of initial T_lidar_to_imu; rotation + x/y translation, z kept from initial value like OpenCalib code.",
+        },
         "transform_imu_lidar": result.transform_imu_lidar.tolist(),
+        "transform_lidar_imu": result.transform_lidar_imu.tolist(),
+        "initial_transform_imu_lidar": result.initial_transform_imu_lidar.tolist(),
+        "delta_transform": result.delta_transform.tolist(),
         "translation": result.translation,
         "rotation_xyzw": result.rotation_xyzw,
         "euler_deg": {
@@ -587,19 +749,41 @@ def result_to_json(result: LidarImuCalibrationResult) -> str:
             "pitch": result.euler_deg[1],
             "yaw": result.euler_deg[2],
         },
-        "metrics": {
-            "pair_count": result.pair_count,
-            "rotation_rmse_deg": result.rotation_rmse_deg,
-            "translation_rmse_m": result.translation_rmse_m,
-            "time_offset_sec": result.time_offset_sec,
-            "interval_sec": result.interval_sec,
-            "min_rotation_deg": result.min_rotation_deg,
-            "lidar_source": result.lidar_source,
-            "lidar_frame_count": result.lidar_frame_count,
-            "lidar_registration_mean_fitness": result.lidar_registration_mean_fitness,
-            "lidar_registration_mean_rmse_m": result.lidar_registration_mean_rmse_m,
-            "lidar_registration_failed_pairs": result.lidar_registration_failed_pairs,
+        "refined_lidar_to_imu": {
+            "translation": result.refined_lidar_to_imu_translation,
+            "euler_deg": {
+                "roll": result.refined_lidar_to_imu_euler_deg[0],
+                "pitch": result.refined_lidar_to_imu_euler_deg[1],
+                "yaw": result.refined_lidar_to_imu_euler_deg[2],
+            },
+            "matrix": result.transform_lidar_imu.tolist(),
         },
+        "metrics": {
+            "pose_count": result.pose_count,
+            "pcd_frame_count": result.pcd_frame_count,
+            "used_frame_count": result.used_frame_count,
+            "round_count": result.round_count,
+            "residual_rmse_m": result.residual_rmse_m,
+            "delta_rpy_deg": result.delta_rpy_deg,
+            "delta_translation": result.delta_translation,
+            "lidar_source": result.lidar_source,
+        },
+        "rounds": [
+            {
+                "round_index": item.round_index,
+                "start_index": item.start_index,
+                "step": item.step,
+                "frame_count": item.frame_count,
+                "feature_points": item.feature_points,
+                "voxel_count": item.voxel_count,
+                "residual_count": item.residual_count,
+                "cost_before": item.cost_before,
+                "cost_after": item.cost_after,
+                "delta_rpy_deg": item.delta_rpy_deg,
+                "delta_t": item.delta_t,
+            }
+            for item in result.rounds
+        ],
         "warnings": result.warnings,
     }
     return json.dumps(payload, ensure_ascii=False, indent=2)
