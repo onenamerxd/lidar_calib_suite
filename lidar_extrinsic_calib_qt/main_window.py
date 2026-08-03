@@ -35,6 +35,7 @@ from .calibrator import (
     load_transform_matrix,
     matrix_to_xyz_quat,
     merge_point_clouds,
+    register_multiframe_translation,
     register_multiscale,
     RegistrationResult,
     save_transform_matrix,
@@ -71,6 +72,7 @@ class MainWindow(QMainWindow):
         self.init_transform: np.ndarray | None = None
         self.result_transform: np.ndarray | None = None
         self.result: RegistrationResult | None = None
+        self.batch_cloud_pairs: list[tuple[Path, Path]] = []
         self.fullscreen_window: FullScreenPointCloudWindow | None = None
 
         self._build_ui()
@@ -120,8 +122,11 @@ class MainWindow(QMainWindow):
         self.target_edit = QLineEdit()
         self.source_edit = QLineEdit()
         self.init_edit = QLineEdit()
-        file_layout.addRow("Target PCD", self._line_with_button(self.target_edit, self._choose_target_pcd))
-        file_layout.addRow("Source PCD", self._line_with_button(self.source_edit, self._choose_source_pcd))
+        self.batch_mode_checkbox = QCheckBox("多帧文件夹联合标定（推荐）")
+        self.batch_mode_checkbox.setChecked(True)
+        file_layout.addRow("", self.batch_mode_checkbox)
+        file_layout.addRow("Target PCD/目录", self._line_with_button(self.target_edit, self._choose_target_pcd))
+        file_layout.addRow("Source PCD/目录", self._line_with_button(self.source_edit, self._choose_source_pcd))
         file_layout.addRow("初始变换 JSON", self._line_with_button(self.init_edit, self._choose_init_json))
         file_button_row = QHBoxLayout()
         self.sample_button = QPushButton("填充样例路径")
@@ -133,12 +138,24 @@ class MainWindow(QMainWindow):
 
         param_group = QGroupBox("配准参数")
         param_layout = QFormLayout(param_group)
-        self.voxel_sizes_edit = QLineEdit("1.0,0.5,0.2,0.1")
-        self.max_corr_edit = QLineEdit("3.0,1.5,0.8,0.4")
+        self.voxel_sizes_edit = QLineEdit("0.5,0.25,0.1,0.05")
+        self.max_corr_edit = QLineEdit("1.0,0.5,0.25,0.12")
         self.max_iters_edit = QLineEdit("200,300,400,500")
         param_layout.addRow("Voxel sizes", self.voxel_sizes_edit)
         param_layout.addRow("Max corr", self.max_corr_edit)
         param_layout.addRow("Max iters", self.max_iters_edit)
+        self.max_translation_delta_spin = self._make_double_spin(0.05, 10.0, 1.0, 0.05, 2)
+        self.max_rotation_delta_spin = self._make_double_spin(0.5, 180.0, 15.0, 0.5, 1)
+        self.min_fitness_spin = self._make_double_spin(0.0, 1.0, 0.05, 0.01, 2)
+        param_layout.addRow("最大平移偏移 (m)", self.max_translation_delta_spin)
+        param_layout.addRow("最大旋转偏移 (deg)", self.max_rotation_delta_spin)
+        param_layout.addRow("最小 fitness", self.min_fitness_spin)
+        self.batch_samples_spin = QSpinBox()
+        self.batch_samples_spin.setRange(5, 1000)
+        self.batch_samples_spin.setValue(97)
+        self.top_overlap_fraction_spin = self._make_double_spin(0.05, 1.0, 0.1, 0.05, 2)
+        param_layout.addRow("多帧采样数", self.batch_samples_spin)
+        param_layout.addRow("高重叠帧比例", self.top_overlap_fraction_spin)
         self.sidebar_layout.addWidget(param_group)
 
         prep_group = QGroupBox("预处理")
@@ -258,11 +275,25 @@ class MainWindow(QMainWindow):
         return spin
 
     def _choose_target_pcd(self) -> None:
+        if self.batch_mode_checkbox.isChecked():
+            path = QFileDialog.getExistingDirectory(
+                self, "选择 Target PCD 目录", self.target_edit.text() or str(Path.home())
+            )
+            if path:
+                self.target_edit.setText(path)
+            return
         path, _ = QFileDialog.getOpenFileName(self, "选择 Target PCD", self.target_edit.text() or str(Path.home()), "PCD (*.pcd)")
         if path:
             self.target_edit.setText(path)
 
     def _choose_source_pcd(self) -> None:
+        if self.batch_mode_checkbox.isChecked():
+            path = QFileDialog.getExistingDirectory(
+                self, "选择 Source PCD 目录", self.source_edit.text() or str(Path.home())
+            )
+            if path:
+                self.source_edit.setText(path)
+            return
         path, _ = QFileDialog.getOpenFileName(self, "选择 Source PCD", self.source_edit.text() or str(Path.home()), "PCD (*.pcd)")
         if path:
             self.source_edit.setText(path)
@@ -293,16 +324,73 @@ class MainWindow(QMainWindow):
             return
 
         try:
-            self.target_cloud = load_point_cloud(Path(target_path))
-            self.source_cloud = load_point_cloud(Path(source_path))
+            target_input = Path(target_path)
+            source_input = Path(source_path)
+            self.batch_cloud_pairs = []
+            if self.batch_mode_checkbox.isChecked():
+                self.batch_cloud_pairs = self._build_batch_pairs(target_input, source_input)
+                preview_target, preview_source = self.batch_cloud_pairs[len(self.batch_cloud_pairs) // 2]
+                self.target_cloud = load_point_cloud(preview_target)
+                self.source_cloud = load_point_cloud(preview_source)
+            else:
+                self.target_cloud = load_point_cloud(target_input)
+                self.source_cloud = load_point_cloud(source_input)
             self.init_transform = load_transform_matrix(Path(init_path))
             self.result_transform = None
             self.result = None
-            self._append_log(f"加载完成: target={target_path}, source={source_path}, init={init_path}")
+            if self.batch_cloud_pairs:
+                self._append_log(
+                    f"多帧加载完成: {len(self.batch_cloud_pairs)} 组同步帧, "
+                    f"target={target_path}, source={source_path}, init={init_path}"
+                )
+            else:
+                self._append_log(f"加载完成: target={target_path}, source={source_path}, init={init_path}")
             self._update_visuals()
             self._fit_views()
         except Exception as exc:
             QMessageBox.critical(self, "加载失败", str(exc))
+
+    def _build_batch_pairs(self, target_dir: Path, source_dir: Path) -> list[tuple[Path, Path]]:
+        if not target_dir.is_dir() or not source_dir.is_dir():
+            raise ValueError("多帧模式需要 Target 和 Source PCD 目录")
+
+        def sort_key(path: Path):
+            try:
+                return 0, int(path.stem)
+            except ValueError:
+                return 1, path.stem
+
+        target_paths = sorted(target_dir.glob("*.pcd"), key=sort_key)
+        source_paths = sorted(source_dir.glob("*.pcd"), key=sort_key)
+        if not target_paths or not source_paths:
+            raise ValueError("PCD 目录为空")
+
+        sample_count = min(self.batch_samples_spin.value(), len(source_paths))
+        source_indices = np.linspace(0, len(source_paths) - 1, sample_count, dtype=int)
+        numeric_timestamps = True
+        try:
+            target_timestamps = np.asarray([int(path.stem) for path in target_paths], dtype=np.int64)
+        except ValueError:
+            numeric_timestamps = False
+            target_timestamps = np.zeros(len(target_paths), dtype=np.int64)
+
+        pairs = []
+        for source_index in source_indices:
+            source_path = source_paths[int(source_index)]
+            if numeric_timestamps:
+                try:
+                    source_timestamp = int(source_path.stem)
+                except ValueError:
+                    numeric_timestamps = False
+            if numeric_timestamps:
+                target_index = int(np.argmin(np.abs(target_timestamps - source_timestamp)))
+            else:
+                target_index = min(
+                    len(target_paths) - 1,
+                    int(round(source_index * (len(target_paths) - 1) / max(len(source_paths) - 1, 1))),
+                )
+            pairs.append((target_paths[target_index], source_path))
+        return pairs
 
     def _fit_views(self) -> None:
         if self.target_cloud is None or self.source_cloud is None or self.init_transform is None:
@@ -359,15 +447,40 @@ class MainWindow(QMainWindow):
 
         self._append_log("开始配准...")
         try:
-            self.result = register_multiscale(
-                target_cloud=self.target_cloud,
-                source_cloud=self.source_cloud,
-                init_transform=self.init_transform,
-                stages=stages,
-                crop_range=crop_range,
-                z_range=z_range,
-                estimation_method=method,
-            )
+            if self.batch_cloud_pairs:
+                self._append_log(
+                    f"启动多帧共同优化: {len(self.batch_cloud_pairs)} 组候选帧, "
+                    f"选取前 {self.top_overlap_fraction_spin.value():.0%} 高重叠帧"
+                )
+                self.result = register_multiframe_translation(
+                    cloud_pairs=self.batch_cloud_pairs,
+                    init_transform=self.init_transform,
+                    voxel_size=0.1,
+                    max_correspondence_distance=0.25,
+                    top_overlap_fraction=self.top_overlap_fraction_spin.value(),
+                    min_selected_pairs=5,
+                    max_selected_pairs=30,
+                    normal_angle_threshold_degrees=30.0,
+                    huber_delta=0.04,
+                    max_iterations=15,
+                    max_points_per_pair=3000,
+                    max_translation_step=0.05,
+                    max_translation_delta=self.max_translation_delta_spin.value(),
+                    z_range=z_range,
+                )
+            else:
+                self.result = register_multiscale(
+                    target_cloud=self.target_cloud,
+                    source_cloud=self.source_cloud,
+                    init_transform=self.init_transform,
+                    stages=stages,
+                    crop_range=crop_range,
+                    z_range=z_range,
+                    estimation_method=method,
+                    max_translation_delta=self.max_translation_delta_spin.value(),
+                    max_rotation_delta_degrees=self.max_rotation_delta_spin.value(),
+                    min_fitness=self.min_fitness_spin.value(),
+                )
             self.result_transform = self.result.transform
             self._append_log("配准完成。")
             self._update_result_output()
@@ -386,13 +499,21 @@ class MainWindow(QMainWindow):
         lines.append(f"fitness={self.result.fitness:.6f}")
         lines.append(f"inlier_rmse={self.result.inlier_rmse:.6f}")
         lines.append(f"converged={self.result.converged}")
+        if hasattr(self.result, "selected_pair_indices"):
+            lines.append(f"selected_pairs={len(self.result.selected_pair_indices)}")
+            lines.append(f"joint_iterations={self.result.iterations}")
+            lines.append(f"joint_correspondences={self.result.correspondence_count}")
         lines.append("")
         lines.append("stage_metrics:")
         for metric in self.result.stage_metrics:
-            lines.append(
+            line = (
                 "stage={stage} voxel={voxel_size:.3f} max_corr={max_correspondence_distance:.3f} "
                 "iters={max_iterations} fitness={fitness:.6f} rmse={inlier_rmse:.6f}".format(**metric)
             )
+            line += f" accepted={metric.get('accepted', True)}"
+            if metric.get("rejection_reason"):
+                line += f" reason={metric['rejection_reason']}"
+            lines.append(line)
         lines.append("")
         lines.append("transform (4x4):")
         lines.append(json.dumps(self.result_transform.tolist(), indent=2))
