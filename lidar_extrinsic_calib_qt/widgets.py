@@ -118,7 +118,8 @@ class PointCloud3DCanvas(QWidget):
         dz = math.sin(el)
         return np.array([self.pan_x + self.distance * dx, self.pan_y + self.distance * dy, self.distance * dz], dtype=np.float64)
 
-    def _look_at_matrix(self) -> np.ndarray:
+    def _camera_basis(self) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Return a continuous camera basis for unrestricted pitch rotation."""
         cam = self._camera_pos()
         target = np.array([self.pan_x, self.pan_y, 0.0], dtype=np.float64)
         forward = target - cam
@@ -127,12 +128,20 @@ class PointCloud3DCanvas(QWidget):
             forward = np.array([0.0, 0.0, -1.0], dtype=np.float64)
         else:
             forward /= norm
-        world_up = np.array([0.0, 0.0, 1.0], dtype=np.float64)
-        if abs(np.dot(forward, world_up)) > 0.9999:
-            world_up = np.array([0.0, 1.0, 0.0], dtype=np.float64)
-        right = np.cross(forward, world_up)
-        right /= np.linalg.norm(right)
+
+        # Derive the right vector from the orbit azimuth instead of a fixed
+        # world-up vector. This stays well-defined at pitch +/-90 degrees and
+        # lets the view turn upside down continuously after crossing a pole.
+        az = math.radians(self.azimuth_deg)
+        right = np.array([-math.sin(az), math.cos(az), 0.0], dtype=np.float64)
         up = np.cross(right, forward)
+        up_norm = np.linalg.norm(up)
+        if up_norm > 1e-12:
+            up /= up_norm
+        return cam, forward, right, up
+
+    def _look_at_matrix(self) -> np.ndarray:
+        cam, forward, right, up = self._camera_basis()
         rot = np.array(
             [
                 [right[0], right[1], right[2], 0.0],
@@ -342,28 +351,11 @@ class PointCloud3DCanvas(QWidget):
         if self._drag_mode == "rotate":
             self.azimuth_deg -= delta.x() * 0.3
             self.elevation_deg += delta.y() * 0.3
-            self.elevation_deg = max(-89.0, min(89.0, self.elevation_deg))
         elif self._drag_mode == "pan":
             scale = self.distance * math.tan(math.radians(self.fov_deg) * 0.5) * 2.0 / max(1.0, float(self.height()))
             dx = -delta.x() * scale
             dy = -delta.y() * scale
-            cam = self._camera_pos()
-            target = np.array([self.pan_x, self.pan_y, 0.0], dtype=np.float64)
-            forward = target - cam
-            norm = np.linalg.norm(forward)
-            if norm > 1e-12:
-                forward /= norm
-            world_up = np.array([0.0, 0.0, 1.0], dtype=np.float64)
-            if abs(np.dot(forward, world_up)) > 0.9999:
-                world_up = np.array([0.0, 1.0, 0.0], dtype=np.float64)
-            right = np.cross(forward, world_up)
-            rnorm = np.linalg.norm(right)
-            if rnorm > 1e-12:
-                right /= rnorm
-            up = np.cross(right, forward)
-            unorm = np.linalg.norm(up)
-            if unorm > 1e-12:
-                up /= unorm
+            _, _, right, up = self._camera_basis()
             self.pan_x += dx * right[0] + dy * up[0]
             self.pan_y += dx * right[1] + dy * up[1]
         self._last_drag_pos = event.pos()

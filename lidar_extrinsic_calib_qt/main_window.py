@@ -34,11 +34,13 @@ from .calibrator import (
     load_point_cloud,
     load_transform_matrix,
     matrix_to_xyz_quat,
+    matrix_to_xyz_rpy,
     merge_point_clouds,
     register_multiframe_translation,
     register_multiscale,
     RegistrationResult,
     save_transform_matrix,
+    xyz_rpy_to_matrix,
 )
 from .math_utils import compute_bounding_box, depth_to_rgb
 from .widgets import PointCloud3DCanvas
@@ -74,6 +76,7 @@ class MainWindow(QMainWindow):
         self.result: RegistrationResult | None = None
         self.batch_cloud_pairs: list[tuple[Path, Path]] = []
         self.fullscreen_window: FullScreenPointCloudWindow | None = None
+        self.init_transform_manually_adjusted = False
 
         self._build_ui()
         self._connect_signals()
@@ -135,6 +138,34 @@ class MainWindow(QMainWindow):
         file_button_row.addWidget(self.load_button)
         file_layout.addRow(file_button_row)
         self.sidebar_layout.addWidget(file_group)
+
+        self.manual_init_group = QGroupBox("初始外参手动调整")
+        self.manual_init_group.setEnabled(False)
+        manual_init_layout = QFormLayout(self.manual_init_group)
+        direction_label = QLabel("Source → Target；旋转为固定轴 XYZ (roll/pitch/yaw)")
+        direction_label.setWordWrap(True)
+        manual_init_layout.addRow(direction_label)
+
+        self.init_x_spin = self._make_double_spin(-100.0, 100.0, 0.0, 0.01, 4)
+        self.init_y_spin = self._make_double_spin(-100.0, 100.0, 0.0, 0.01, 4)
+        self.init_z_spin = self._make_double_spin(-100.0, 100.0, 0.0, 0.01, 4)
+        self.init_roll_spin = self._make_double_spin(-360.0, 360.0, 0.0, 0.1, 3)
+        self.init_pitch_spin = self._make_double_spin(-360.0, 360.0, 0.0, 0.1, 3)
+        self.init_yaw_spin = self._make_double_spin(-360.0, 360.0, 0.0, 0.1, 3)
+        manual_init_layout.addRow("X (m)", self.init_x_spin)
+        manual_init_layout.addRow("Y (m)", self.init_y_spin)
+        manual_init_layout.addRow("Z (m)", self.init_z_spin)
+        manual_init_layout.addRow("Roll (deg)", self.init_roll_spin)
+        manual_init_layout.addRow("Pitch (deg)", self.init_pitch_spin)
+        manual_init_layout.addRow("Yaw (deg)", self.init_yaw_spin)
+
+        manual_button_row = QHBoxLayout()
+        self.reload_init_button = QPushButton("从 JSON 重载")
+        self.save_init_button = QPushButton("保存当前初值")
+        manual_button_row.addWidget(self.reload_init_button)
+        manual_button_row.addWidget(self.save_init_button)
+        manual_init_layout.addRow(manual_button_row)
+        self.sidebar_layout.addWidget(self.manual_init_group)
 
         param_group = QGroupBox("配准参数")
         param_layout = QFormLayout(param_group)
@@ -225,6 +256,11 @@ class MainWindow(QMainWindow):
         self.save_matrix_button.clicked.connect(self._save_matrix)
         self.save_aligned_button.clicked.connect(self._save_aligned)
         self.save_merged_button.clicked.connect(self._save_merged)
+        self.reload_init_button.clicked.connect(self._reload_initial_transform)
+        self.save_init_button.clicked.connect(self._save_initial_transform)
+
+        for widget in self._initial_transform_spins():
+            widget.valueChanged.connect(self._on_initial_transform_changed)
 
         for widget in [
             self.crop_range_spin,
@@ -273,6 +309,85 @@ class MainWindow(QMainWindow):
         spin.setSingleStep(step)
         spin.setDecimals(decimals)
         return spin
+
+    def _initial_transform_spins(self) -> list[QDoubleSpinBox]:
+        return [
+            self.init_x_spin,
+            self.init_y_spin,
+            self.init_z_spin,
+            self.init_roll_spin,
+            self.init_pitch_spin,
+            self.init_yaw_spin,
+        ]
+
+    def _set_initial_transform_controls(self, transform: np.ndarray) -> None:
+        values = matrix_to_xyz_rpy(transform)
+        spins = self._initial_transform_spins()
+        for spin in spins:
+            spin.blockSignals(True)
+        try:
+            for spin, value in zip(spins, values):
+                spin.setValue(value)
+        finally:
+            for spin in spins:
+                spin.blockSignals(False)
+
+    def _initial_transform_from_controls(self) -> np.ndarray:
+        return xyz_rpy_to_matrix(
+            self.init_x_spin.value(),
+            self.init_y_spin.value(),
+            self.init_z_spin.value(),
+            self.init_roll_spin.value(),
+            self.init_pitch_spin.value(),
+            self.init_yaw_spin.value(),
+        )
+
+    def _clear_registration_result(self) -> None:
+        self.result_transform = None
+        self.result = None
+        self._update_result_output()
+
+    def _on_initial_transform_changed(self, _value: float) -> None:
+        if self.init_transform is None:
+            return
+        self.init_transform = self._initial_transform_from_controls()
+        self.init_transform_manually_adjusted = True
+        self._clear_registration_result()
+        self._update_visuals()
+
+    def _reload_initial_transform(self) -> None:
+        init_path = self.init_edit.text().strip()
+        if not init_path:
+            QMessageBox.warning(self, "缺少文件", "请先选择初始变换 JSON。")
+            return
+        try:
+            self.init_transform = load_transform_matrix(Path(init_path))
+            self._set_initial_transform_controls(self.init_transform)
+            self.init_transform_manually_adjusted = False
+            self._clear_registration_result()
+            self._update_visuals()
+            self._reset_before_views()
+            self._append_log(f"已从 JSON 重载初始外参: {init_path}")
+        except Exception as exc:
+            QMessageBox.critical(self, "重载失败", str(exc))
+
+    def _save_initial_transform(self) -> None:
+        if self.init_transform is None:
+            QMessageBox.warning(self, "无初值", "请先加载数据和初始变换。")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "保存当前初始外参",
+            str(Path.home() / "init_source_to_target.json"),
+            "JSON (*.json)",
+        )
+        if not path:
+            return
+        try:
+            save_transform_matrix(Path(path), self.init_transform)
+            self._append_log(f"已保存当前初始外参: {path}")
+        except Exception as exc:
+            QMessageBox.critical(self, "保存失败", str(exc))
 
     def _choose_target_pcd(self) -> None:
         if self.batch_mode_checkbox.isChecked():
@@ -336,8 +451,10 @@ class MainWindow(QMainWindow):
                 self.target_cloud = load_point_cloud(target_input)
                 self.source_cloud = load_point_cloud(source_input)
             self.init_transform = load_transform_matrix(Path(init_path))
-            self.result_transform = None
-            self.result = None
+            self._set_initial_transform_controls(self.init_transform)
+            self.manual_init_group.setEnabled(True)
+            self.init_transform_manually_adjusted = False
+            self._clear_registration_result()
             if self.batch_cloud_pairs:
                 self._append_log(
                     f"多帧加载完成: {len(self.batch_cloud_pairs)} 组同步帧, "
@@ -491,7 +608,16 @@ class MainWindow(QMainWindow):
 
     def _update_result_output(self) -> None:
         if self.result is None or self.result_transform is None:
-            self.result_output.setPlainText("尚未运行配准。")
+            if self.init_transform is None:
+                self.result_output.setPlainText("尚未运行配准。")
+                return
+            xyz_rpy = matrix_to_xyz_rpy(self.init_transform)
+            self.result_output.setPlainText(
+                "当前初始变换 (Source -> Target):\n"
+                f"xyz_rpy_deg={json.dumps(xyz_rpy)}\n\n"
+                f"{json.dumps(self.init_transform.tolist(), indent=2)}\n\n"
+                "尚未运行配准。"
+            )
             return
 
         xyz_quat = matrix_to_xyz_quat(self.result_transform)
@@ -573,12 +699,17 @@ class MainWindow(QMainWindow):
         target_count = len(self.target_cloud.points)
         source_count = len(self.source_cloud.points)
 
-        self.before_3d.set_status_lines([f"Target(红): {target_count} 点", f"Source(绿): {source_count} 点"])
+        init_status = "初始外参: 手动调整" if self.init_transform_manually_adjusted else "初始外参: JSON"
+        self.before_3d.set_status_lines(
+            [f"Target(红): {target_count} 点", f"Source(绿): {source_count} 点", init_status]
+        )
 
         if self.result_transform is not None:
             self.after_3d.set_status_lines([f"Target(红): {target_count} 点", f"Aligned(绿): {source_count} 点", "配准已完成"])
         else:
-            self.after_3d.set_status_lines([f"Target(红): {target_count} 点", f"Aligned(绿): {source_count} 点", "尚未配准"])
+            self.after_3d.set_status_lines(
+                [f"Target(红): {target_count} 点", f"Aligned(绿): {source_count} 点", "当前显示初始外参"]
+            )
 
     def _save_matrix(self) -> None:
         if self.result_transform is None:

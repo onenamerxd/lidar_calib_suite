@@ -90,6 +90,69 @@ def load_transform_matrix(path: Path) -> np.ndarray:
     return matrix
 
 
+def xyz_rpy_to_matrix(
+    x: float,
+    y: float,
+    z: float,
+    roll_degrees: float,
+    pitch_degrees: float,
+    yaw_degrees: float,
+) -> np.ndarray:
+    """Build a Source -> Target transform from XYZ and fixed-axis RPY angles."""
+    roll, pitch, yaw = np.deg2rad([roll_degrees, pitch_degrees, yaw_degrees])
+    sin_roll, cos_roll = np.sin(roll), np.cos(roll)
+    sin_pitch, cos_pitch = np.sin(pitch), np.cos(pitch)
+    sin_yaw, cos_yaw = np.sin(yaw), np.cos(yaw)
+
+    rotation_x = np.array(
+        [[1.0, 0.0, 0.0], [0.0, cos_roll, -sin_roll], [0.0, sin_roll, cos_roll]],
+        dtype=float,
+    )
+    rotation_y = np.array(
+        [[cos_pitch, 0.0, sin_pitch], [0.0, 1.0, 0.0], [-sin_pitch, 0.0, cos_pitch]],
+        dtype=float,
+    )
+    rotation_z = np.array(
+        [[cos_yaw, -sin_yaw, 0.0], [sin_yaw, cos_yaw, 0.0], [0.0, 0.0, 1.0]],
+        dtype=float,
+    )
+
+    transform = np.eye(4, dtype=float)
+    transform[:3, :3] = rotation_z @ rotation_y @ rotation_x
+    transform[:3, 3] = [x, y, z]
+    return transform
+
+
+def matrix_to_xyz_rpy(transform: np.ndarray) -> List[float]:
+    """Return XYZ and fixed-axis RPY degrees from a homogeneous transform."""
+    matrix = np.asarray(transform, dtype=float)
+    if matrix.shape != (4, 4):
+        raise ValueError(f"Expected a 4x4 transform matrix, got shape {matrix.shape}")
+
+    rotation = matrix[:3, :3]
+    horizontal_norm = float(np.hypot(rotation[0, 0], rotation[1, 0]))
+    if horizontal_norm > 1e-8:
+        roll = np.arctan2(rotation[2, 1], rotation[2, 2])
+        pitch = np.arctan2(-rotation[2, 0], horizontal_norm)
+        yaw = np.arctan2(rotation[1, 0], rotation[0, 0])
+    else:
+        # At pitch +/-90 degrees roll and yaw are coupled. Keep yaw at zero and
+        # put the observable rotation into roll so rebuilding stays equivalent.
+        roll = np.arctan2(-rotation[1, 2], rotation[1, 1])
+        pitch = np.arctan2(-rotation[2, 0], horizontal_norm)
+        yaw = 0.0
+
+    roll_degrees, pitch_degrees, yaw_degrees = np.rad2deg([roll, pitch, yaw])
+    return [
+        float(matrix[0, 3]),
+        float(matrix[1, 3]),
+        float(matrix[2, 3]),
+        float(roll_degrees),
+        float(pitch_degrees),
+        float(yaw_degrees),
+    ]
+
+
 def load_point_cloud(path: Path) -> o3d.geometry.PointCloud:
     cloud = o3d.io.read_point_cloud(str(path))
     if cloud.is_empty():

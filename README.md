@@ -72,6 +72,17 @@ calibration_toolbox/
 2. 多个工具可以同时打开，互不干扰。
 3. 每个工具的使用方式与原项目完全一致。
 
+## LiDAR-LiDAR 初始外参手动调整
+
+LiDAR-LiDAR 标定页面支持在配准前手动调整初始外参：
+
+1. 选择 Target PCD、Source PCD 和初始变换 JSON，然后点击“加载数据”。
+2. 在“初始外参手动调整”中修改 `X/Y/Z` 和 `Roll/Pitch/Yaw`。平移单位为米，角度单位为度。
+3. 右侧“配准前”视图会实时显示调整结果：Target 为红色，经初始外参变换后的 Source 为绿色。
+4. 点击“运行配准”时，单帧和多帧模式都会使用当前手动调整后的矩阵作为初值。
+
+外参方向为 `Source -> Target`。旋转控件使用固定轴 XYZ 的 roll/pitch/yaw，构造矩阵时为 `Rz(yaw) * Ry(pitch) * Rx(roll)`。“从 JSON 重载”可撤销手动调整，“保存当前初值”可将调好的 4x4 矩阵另存为 JSON。
+
 ## LiDAR-IMU 自动标定
 
 LiDAR-IMU 模块已替换为 OpenCalib `lidar2imu/auto_calib` 的自动标定方案复现，不再使用旧的 ICP 里程计 + 手眼标定简化流程。
