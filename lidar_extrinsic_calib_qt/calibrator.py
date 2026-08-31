@@ -166,13 +166,16 @@ def load_point_cloud(path: Path) -> o3d.geometry.PointCloud:
     return cloud
 
 
-def crop_point_cloud(
-    cloud: o3d.geometry.PointCloud, crop_range: Optional[float], z_range: Optional[Tuple[Optional[float], Optional[float]]]
-) -> o3d.geometry.PointCloud:
-    if crop_range is None and z_range is None:
-        return cloud
+def build_point_filter_mask(
+    points: np.ndarray,
+    crop_range: Optional[float],
+    z_range: Optional[Tuple[Optional[float], Optional[float]]],
+) -> np.ndarray:
+    """Build the common XY/Z mask used by registration and visualization."""
+    points = np.asarray(points)
+    if points.ndim != 2 or points.shape[1] < 3:
+        raise ValueError(f"Expected point array with shape (N, >=3), got {points.shape}")
 
-    points = np.asarray(cloud.points)
     mask = np.ones(points.shape[0], dtype=bool)
 
     if crop_range is not None:
@@ -184,6 +187,18 @@ def crop_point_cloud(
             mask &= points[:, 2] >= z_min
         if z_max is not None:
             mask &= points[:, 2] <= z_max
+
+    return mask
+
+
+def crop_point_cloud(
+    cloud: o3d.geometry.PointCloud, crop_range: Optional[float], z_range: Optional[Tuple[Optional[float], Optional[float]]]
+) -> o3d.geometry.PointCloud:
+    if crop_range is None and z_range is None:
+        return cloud
+
+    points = np.asarray(cloud.points)
+    mask = build_point_filter_mask(points, crop_range, z_range)
 
     cropped = cloud.select_by_index(np.flatnonzero(mask))
     if cropped.is_empty():
@@ -327,12 +342,12 @@ def register_multiscale(
     )
 
 
-def _prepare_multiframe_cloud(cloud_or_path, voxel_size: float, z_range):
+def _prepare_multiframe_cloud(cloud_or_path, voxel_size: float, crop_range, z_range):
     if isinstance(cloud_or_path, (str, Path)):
         cloud = load_point_cloud(Path(cloud_or_path))
     else:
         cloud = o3d.geometry.PointCloud(cloud_or_path)
-    prepared = preprocess_cloud(cloud, voxel_size, None, z_range, "point_to_plane")
+    prepared = preprocess_cloud(cloud, voxel_size, crop_range, z_range, "point_to_plane")
     return np.asarray(prepared.points).copy(), np.asarray(prepared.normals).copy()
 
 
@@ -350,6 +365,7 @@ def register_multiframe_translation(
     max_points_per_pair: int = 3000,
     max_translation_step: float = 0.05,
     max_translation_delta: float = 1.0,
+    crop_range: Optional[float] = None,
     z_range: Optional[Tuple[Optional[float], Optional[float]]] = (-5.0, 5.0),
     random_seed: int = 42,
 ) -> MultiFrameRegistrationResult:
@@ -382,8 +398,12 @@ def register_multiframe_translation(
     prepared_pairs = []
     overlap_scores = []
     for target_input, source_input in cloud_pairs:
-        target_points, target_normals = _prepare_multiframe_cloud(target_input, voxel_size, z_range)
-        source_points, source_normals = _prepare_multiframe_cloud(source_input, voxel_size, z_range)
+        target_points, target_normals = _prepare_multiframe_cloud(
+            target_input, voxel_size, crop_range, z_range
+        )
+        source_points, source_normals = _prepare_multiframe_cloud(
+            source_input, voxel_size, crop_range, z_range
+        )
         target_tree = cKDTree(target_points)
         source_initial = source_points @ rotation.T + initial_translation
         distances, target_indices = target_tree.query(source_initial, workers=-1)

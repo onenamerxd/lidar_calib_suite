@@ -30,6 +30,7 @@ from PySide6.QtWidgets import (
 )
 
 from .calibrator import (
+    build_point_filter_mask,
     build_registration_stages,
     load_point_cloud,
     load_transform_matrix,
@@ -50,6 +51,7 @@ class FullScreenPointCloudWindow(QDialog):
     def __init__(self, source_canvas: PointCloud3DCanvas, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setWindowTitle("点云全屏显示")
+        self.source_canvas = source_canvas
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -61,6 +63,13 @@ class FullScreenPointCloudWindow(QDialog):
 
         self._escape_shortcut = QShortcut(QKeySequence("Esc"), self)
         self._escape_shortcut.activated.connect(self.close)
+
+    def refresh_content(self) -> None:
+        """Refresh point data while preserving the full-screen camera view."""
+        view_state = self.canvas.get_view_state()
+        self.canvas.copy_from(self.source_canvas)
+        self.canvas.set_view_state(view_state)
+        self.canvas.set_fullscreen_button_tooltip("退出全屏")
 
 
 class MainWindow(QMainWindow):
@@ -512,32 +521,32 @@ class MainWindow(QMainWindow):
     def _fit_views(self) -> None:
         if self.target_cloud is None or self.source_cloud is None or self.init_transform is None:
             return
-        target_pts = np.asarray(self.target_cloud.points)
-        source_init = np.asarray(self.source_cloud.points).copy()
-        ones = np.ones((source_init.shape[0], 1))
-        homo = np.concatenate([source_init, ones], axis=1)
-        source_init = (self.init_transform @ homo.T).T[:, :3]
-        all_pts = np.concatenate([target_pts, source_init], axis=0)
-
-        self.before_3d.fit_to_points(all_pts)
-        self.after_3d.fit_to_points(all_pts)
+        before_pts, _, _, _, _ = self._make_combined_arrays(
+            self.target_cloud, self.source_cloud, self.init_transform
+        )
+        after_transform = self.result_transform if self.result_transform is not None else self.init_transform
+        after_pts, _, _, _, _ = self._make_combined_arrays(
+            self.target_cloud, self.source_cloud, after_transform
+        )
+        self.before_3d.fit_to_points(before_pts)
+        self.after_3d.fit_to_points(after_pts)
 
     def _reset_before_views(self) -> None:
         if self.target_cloud is not None and self.source_cloud is not None and self.init_transform is not None:
-            target_pts = np.asarray(self.target_cloud.points)
-            source_init = np.asarray(self.source_cloud.points).copy()
-            ones = np.ones((source_init.shape[0], 1))
-            homo = np.concatenate([source_init, ones], axis=1)
-            source_init = (self.init_transform @ homo.T).T[:, :3]
-            all_pts = np.concatenate([target_pts, source_init], axis=0)
-            self.before_3d.fit_to_points(all_pts)
+            points, _, _, _, _ = self._make_combined_arrays(
+                self.target_cloud, self.source_cloud, self.init_transform
+            )
+            self.before_3d.fit_to_points(points)
         else:
             self.before_3d.reset_view()
 
     def _reset_after_views(self) -> None:
-        if self.target_cloud is not None and self.source_cloud is not None:
-            all_pts = np.concatenate([np.asarray(self.target_cloud.points), np.asarray(self.source_cloud.points)], axis=0)
-            self.after_3d.fit_to_points(all_pts)
+        if self.target_cloud is not None and self.source_cloud is not None and self.init_transform is not None:
+            transform = self.result_transform if self.result_transform is not None else self.init_transform
+            points, _, _, _, _ = self._make_combined_arrays(
+                self.target_cloud, self.source_cloud, transform
+            )
+            self.after_3d.fit_to_points(points)
         else:
             self.after_3d.reset_view()
 
@@ -583,6 +592,7 @@ class MainWindow(QMainWindow):
                     max_points_per_pair=3000,
                     max_translation_step=0.05,
                     max_translation_delta=self.max_translation_delta_spin.value(),
+                    crop_range=crop_range,
                     z_range=z_range,
                 )
             else:
@@ -649,9 +659,20 @@ class MainWindow(QMainWindow):
 
     def _make_combined_arrays(
         self, target_cloud: o3d.geometry.PointCloud, source_cloud: o3d.geometry.PointCloud, transform: np.ndarray | None
-    ) -> tuple[np.ndarray, np.ndarray]:
-        target_pts = np.asarray(target_cloud.points, dtype=np.float32)
-        source_pts = np.asarray(source_cloud.points, dtype=np.float32)
+    ) -> tuple[np.ndarray, np.ndarray, int, int, int]:
+        target_raw = np.asarray(target_cloud.points, dtype=np.float32)
+        source_raw = np.asarray(source_cloud.points, dtype=np.float32)
+        crop_range = self.crop_range_spin.value() if self.crop_range_spin.value() > 0 else None
+        z_range = (self.z_min_spin.value(), self.z_max_spin.value())
+
+        # Match the registration convention: filter each cloud in its own
+        # sensor frame first, then transform Source into the Target frame.
+        target_mask = build_point_filter_mask(target_raw, crop_range, z_range)
+        source_mask = build_point_filter_mask(source_raw, crop_range, z_range)
+        target_pts = target_raw[target_mask]
+        source_pts = source_raw[source_mask]
+        target_filtered_count = int(target_pts.shape[0])
+        source_filtered_count = int(source_pts.shape[0])
 
         if transform is not None:
             ones = np.ones((source_pts.shape[0], 1), dtype=np.float32)
@@ -667,13 +688,27 @@ class MainWindow(QMainWindow):
             source_color = np.full((source_pts.shape[0], 3), [80, 255, 120], dtype=np.uint8)
             all_colors = np.concatenate([target_color, source_color], axis=0)
 
+        filtered_total = int(all_pts.shape[0])
         max_points = self.max_points_spin.value()
         if all_pts.shape[0] > max_points:
             stride = max(1, int(np.ceil(all_pts.shape[0] / max_points)))
             all_pts = all_pts[::stride]
             all_colors = all_colors[::stride]
 
-        return all_pts, all_colors
+        return all_pts, all_colors, target_filtered_count, source_filtered_count, filtered_total
+
+    def _filter_status_line(self) -> str:
+        crop_range = self.crop_range_spin.value()
+        xy_text = f"XY≤{crop_range:.2f}m" if crop_range > 0 else "XY不限"
+        z_min = self.z_min_spin.value()
+        z_max = self.z_max_spin.value()
+        if z_min > z_max:
+            return f"筛选范围无效: Z最小值 {z_min:.2f} > Z最大值 {z_max:.2f}"
+        return f"筛选: {xy_text}, Z=[{z_min:.2f}, {z_max:.2f}]m"
+
+    def _refresh_fullscreen_view(self) -> None:
+        if self.fullscreen_window is not None:
+            self.fullscreen_window.refresh_content()
 
     def _update_visuals(self) -> None:
         has_data = self.target_cloud is not None and self.source_cloud is not None and self.init_transform is not None
@@ -683,13 +718,14 @@ class MainWindow(QMainWindow):
             self.after_3d.set_points(np.zeros((0, 3), dtype=np.float32), np.zeros((0, 3), dtype=np.uint8))
             self.before_3d.set_status_lines(["未加载数据"])
             self.after_3d.set_status_lines(["未加载数据"])
+            self._refresh_fullscreen_view()
             return
 
-        before_pts, before_colors = self._make_combined_arrays(
+        before_pts, before_colors, target_filtered_count, source_filtered_count, filtered_total = self._make_combined_arrays(
             self.target_cloud, self.source_cloud, self.init_transform
         )
         after_transform = self.result_transform if self.result_transform is not None else self.init_transform
-        after_pts, after_colors = self._make_combined_arrays(
+        after_pts, after_colors, _, _, after_filtered_total = self._make_combined_arrays(
             self.target_cloud, self.source_cloud, after_transform
         )
 
@@ -698,18 +734,34 @@ class MainWindow(QMainWindow):
 
         target_count = len(self.target_cloud.points)
         source_count = len(self.source_cloud.points)
+        filter_status = self._filter_status_line()
 
         init_status = "初始外参: 手动调整" if self.init_transform_manually_adjusted else "初始外参: JSON"
         self.before_3d.set_status_lines(
-            [f"Target(红): {target_count} 点", f"Source(绿): {source_count} 点", init_status]
+            [
+                f"Target(红): {target_filtered_count}/{target_count} 点",
+                f"Source(绿): {source_filtered_count}/{source_count} 点",
+                f"画布显示: {before_pts.shape[0]}/{filtered_total} 点",
+                filter_status,
+                init_status,
+            ]
         )
 
+        after_status = "配准已完成" if self.result_transform is not None else "当前显示初始外参"
         if self.result_transform is not None:
-            self.after_3d.set_status_lines([f"Target(红): {target_count} 点", f"Aligned(绿): {source_count} 点", "配准已完成"])
+            aligned_name = "Aligned"
         else:
-            self.after_3d.set_status_lines(
-                [f"Target(红): {target_count} 点", f"Aligned(绿): {source_count} 点", "当前显示初始外参"]
-            )
+            aligned_name = "Source"
+        self.after_3d.set_status_lines(
+            [
+                f"Target(红): {target_filtered_count}/{target_count} 点",
+                f"{aligned_name}(绿): {source_filtered_count}/{source_count} 点",
+                f"画布显示: {after_pts.shape[0]}/{after_filtered_total} 点",
+                filter_status,
+                after_status,
+            ]
+        )
+        self._refresh_fullscreen_view()
 
     def _save_matrix(self) -> None:
         if self.result_transform is None:

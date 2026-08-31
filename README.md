@@ -83,6 +83,8 @@ LiDAR-LiDAR 标定页面支持在配准前手动调整初始外参：
 
 外参方向为 `Source -> Target`。旋转控件使用固定轴 XYZ 的 roll/pitch/yaw，构造矩阵时为 `Rz(yaw) * Ry(pitch) * Rx(roll)`。“从 JSON 重载”可撤销手动调整，“保存当前初值”可将调好的 4x4 矩阵另存为 JSON。
 
+“预处理”中的 XY 裁剪半径和 Z 最小/最大值会同时作用于点云预览和配准输入。界面显示“筛选后点数/原始点数”；Source 与 Target 均先在各自传感器坐标系中筛选，再将 Source 变换到 Target 坐标系。全屏预览也会随筛选参数实时刷新。
+
 ## LiDAR-IMU 自动标定
 
 LiDAR-IMU 模块已替换为 OpenCalib `lidar2imu/auto_calib` 的自动标定方案复现，不再使用旧的 ICP 里程计 + 手眼标定简化流程。
